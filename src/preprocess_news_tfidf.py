@@ -1,9 +1,16 @@
 """
-preprocess_news.py
-==================
-Pipeline pembersihan teks berita: data/raw/cnbc_raw.csv -> data/processed/news_clean.csv
+preprocess_news_tfidf.py
+========================
+Pipeline pembersihan teks berita KHUSUS jalur TF-IDF:
+data/raw/cnbc_raw.csv -> data/processed/news_tfidf_clean.csv
 
-URUTAN TAHAP (urutannya disengaja, bukan acak):
+Jalur BERT/FinBERT ditangani di script terpisah milik rekan tim (bukan file
+ini) -- karena itu output final di sini HANYA menyimpan text_norm, bukan
+text_clean/title_clean lagi (meski keduanya tetap dihitung sebagai langkah
+antara, karena text_norm diturunkan dari text_clean, dan relevance_score /
+has_negative sengaja discoring dari title+desc, bukan dari text_norm).
+
+URUTAN TAHAP :
 
   1. Deduplikasi struktural   -- paling murah, dilakukan duluan supaya tahap
                                  berikutnya memproses lebih sedikit baris
@@ -12,27 +19,15 @@ URUTAN TAHAP (urutannya disengaja, bukan acak):
   4. Buang boilerplate CNBC   -- kalimat berulang yang muncul di ribuan artikel
   5. Filter panjang           -- dokumen terlalu pendek tidak informatif
   6. Filter relevansi tahap-2 -- skoring leksikon berbobot + leksikon negatif
-  7. Dua jalur output teks    -- text_clean (untuk transformer)
-                                 text_norm  (untuk baseline TF-IDF)
-
-KEPUTUSAN PENTING: DUA JALUR TEKS
----------------------------------
-Kami sengaja TIDAK menghasilkan satu kolom teks.
-
-  text_clean : kapitalisasi asli, tanda baca utuh, angka utuh.
-               Dipakai untuk BERT/FinBERT dan NER. Model transformer punya
-               tokenizer sendiri dan MEMBUTUHKAN kapitalisasi -- pada korpus
-               ini itu krusial untuk membedakan "US" (negara) dari "us"
-               (kata ganti). Tanda baca menandai batas kalimat.
-
-  text_norm  : lowercase, tanda baca dibuang, stopword dibuang.
-               Dipakai untuk baseline bag-of-words / TF-IDF.
-
-Menyediakan keduanya berarti Tugas 2 dan 3 tidak perlu scraping ulang.
+  7. text_norm                -- lowercase, stopword dibuang, tanda baca
+                                 dibuang kecuali ".", "$", "%" -- inilah
+                                 satu-satunya kolom teks yang disimpan.
 
 YANG SENGAJA TIDAK DIBUANG (kebalikan dari pipeline default):
   - Angka & persentase  : "oil surges 8%", "sanksi $100 miliar" -- magnitudo
-                          adalah sinyal, bukan noise.
+                          adalah sinyal, bukan noise. (Untuk text_norm/TF-IDF,
+                          hanya simbol ".", "$", dan "%" yang dipertahankan --
+                          simbol lain seperti "'" dan "-" dibuang.)
   - Kata negasi         : not / no / never / without. Daftar stopword standar
                           membuang ini dan MEMBALIK makna sentimen.
   - Nama entitas        : Russia, OPEC, Iran -- ini prediktor utamanya.
@@ -59,7 +54,7 @@ RE_WS = re.compile(r"\s+")
 RE_ZEROWIDTH = re.compile(r"[\u200b-\u200f\u202a-\u202e\ufeff]")
 RE_BOILER = [re.compile(p, re.IGNORECASE) for p in C.BOILERPLATE_PATTERNS]
 RE_TITLE_NORM = re.compile(r"[^a-z0-9 ]")
-RE_TOKEN = re.compile(r"[a-z0-9%$][a-z0-9%$'\-\.]*")
+RE_TOKEN = re.compile(r"[a-z0-9%$][a-z0-9%$.]*")
 
 # Leksikon relevansi -> regex dengan word boundary, supaya "war" tidak
 # ikut cocok di dalam kata "warehouse" atau "reward".
@@ -67,7 +62,14 @@ LEX_PATTERNS = {
     term: re.compile(r"\b" + re.escape(term) + r"\b", re.IGNORECASE)
     for term in C.GEO_LEXICON
 }
-NEG_PATTERNS = [re.compile(re.escape(t), re.IGNORECASE) for t in C.NEGATIVE_LEXICON]
+# \b WAJIB di sini juga -- tanpanya, term pendek nyangkut sebagai substring
+# di kata lain: "nfl" cocok di dalam "conflict"/"inflation", "nba" cocok di
+# dalam "donbas" (wilayah sengketa Ukraina!) dan "greenback", "hire" cocok
+# di "hampshire"/"berkshire"/"oxfordshire". Ditemukan lewat audit: bug ini
+# menyebabkan ~1.922 artikel relevan (skor >= threshold) salah ditolak.
+NEG_PATTERNS = [
+    re.compile(r"\b" + re.escape(t) + r"\b", re.IGNORECASE) for t in C.NEGATIVE_LEXICON
+]
 
 
 # ---------------------------------------------------------------------------
@@ -115,16 +117,17 @@ def clean_text(text):
 
 def normalize_text(text):
     """
-    Menghasilkan text_norm untuk baseline bag-of-words.
+    Menghasilkan text_norm untuk baseline bag-of-words / TF-IDF.
     Lowercase + tokenisasi + buang stopword.
 
-    Perhatikan pola RE_TOKEN: ia sengaja mengizinkan $ dan % agar token
-    seperti "8%" dan "$100" tetap utuh -- itu informasi magnitudo.
+    Simbol yang dipertahankan hanya ".", "$", dan "%" (mis. "$100", "3.5",
+    "8%"). Simbol lain ("'", "-", dll.) dibuang -- misal "co-founder"
+    pecah jadi dua token "co" dan "founder".
     """
     if not text:
         return ""
     tokens = RE_TOKEN.findall(text.lower())
-    tokens = [tok.strip(".-'") for tok in tokens]
+    tokens = [tok.strip(".") for tok in tokens]
     tokens = [tok for tok in tokens if tok and tok not in C.STOPWORDS and len(tok) > 1]
     return " ".join(tokens)
 
@@ -198,12 +201,33 @@ def main():
     log.append(("3. Setelah buang video/non-artikel", len(df)))
 
     # --- TAHAP 3 & 4: bersihkan teks ----------------------------------------
-    # Judul + deskripsi digabung jadi satu dokumen. Judul membawa sinyal
-    # terkuat, deskripsi memberi konteks. Keduanya dibersihkan terpisah lalu
-    # disambung agar boilerplate di deskripsi tidak mencemari judul.
+    # Judul + deskripsi + isi artikel digabung jadi satu dokumen. Judul
+    # membawa sinyal terkuat, deskripsi memberi konteks, body memberi detail
+    # penuh (mayoritas artikel raw sudah punya kolom body hasil scraping
+    # Stage 3). Ketiganya dibersihkan terpisah lalu disambung dengan ". "
+    # supaya boilerplate di satu bagian tidak mencemari bagian lain, dan
+    # bagian yang kosong (mis. body tidak berhasil di-scrape) dilewati saja.
     df["title_clean"] = df["title"].apply(clean_text)
     df["desc_clean"] = df["description"].apply(clean_text)
-    df["text_clean"] = (df["title_clean"] + ". " + df["desc_clean"]).str.strip(". ").str.strip()
+    df["body_clean"] = df["body"].apply(clean_text) if "body" in df.columns else ""
+
+    # Teks KHUSUS untuk skoring relevansi & leksikon negatif: title+desc SAJA.
+    # Body sengaja TIDAK diikutkan di sini. Diuji coba: memasukkan body ke
+    # skoring menyebabkan ~3.000 artikel yang jelas relevan (skor sampai 22)
+    # salah ditolak, karena satu kata di NEGATIVE_LEXICON (mis. "hiring",
+    # "earnings beat") kebetulan muncul di suatu paragraf body 500+ kata yang
+    # tidak berhubungan dengan topik utama artikel. Leksikon ini dikalibrasi
+    # untuk teks pendek (judul+deskripsi), bukan artikel penuh.
+    df["text_for_filter"] = df.apply(
+        lambda r: ". ".join(p for p in (r["title_clean"], r["desc_clean"]) if p),
+        axis=1,
+    )
+
+    # text_clean FINAL (output untuk BERT & basis text_norm/TF-IDF): title+desc+body.
+    df["text_clean"] = df.apply(
+        lambda r: ". ".join(p for p in (r["title_clean"], r["desc_clean"], r["body_clean"]) if p),
+        axis=1,
+    )
 
     # --- TAHAP 5: filter panjang --------------------------------------------
     df["n_tokens"] = df["text_clean"].str.split().str.len()
@@ -211,10 +235,10 @@ def main():
     log.append((f"4. Setelah filter panjang (>= {C.MIN_TOKENS} token)", len(df)))
 
     # --- TAHAP 6: relevansi --------------------------------------------------
-    scored = df["text_clean"].apply(relevance_score)
+    scored = df["text_for_filter"].apply(relevance_score)
     df["relevance_score"] = [s for s, _ in scored]
     df["matched_terms"] = ["|".join(m) for _, m in scored]
-    df["has_negative"] = df["text_clean"].apply(has_negative)
+    df["has_negative"] = df["text_for_filter"].apply(has_negative)
 
     keep = (df["relevance_score"] >= C.RELEVANCE_THRESHOLD) & (~df["has_negative"])
 
@@ -237,14 +261,16 @@ def main():
     log.append(("6. Setelah validasi timestamp", len(df)))
 
     # --- kolom final ---------------------------------------------------------
+    # title_clean/text_clean SENGAJA tidak ikut disimpan -- itu jalur BERT,
+    # ditangani di script terpisah milik rekan tim. File ini cuma nyimpen
+    # text_norm sebagai representasi teks.
     cols = [
-        "article_id", "url", "title_clean", "text_clean", "text_norm",
-        "section", "author", "published_utc", "published_wib",
-        "search_keywords", "keyword_groups", "n_keyword_hits",
-        "relevance_score", "matched_terms", "n_tokens",
+        "url", "text_norm",
+        "section", "published_utc", "published_wib",
+        "relevance_score", "matched_terms",
     ]
     out = df[[c for c in cols if c in df.columns]].sort_values("published_utc")
-    out.to_csv(C.NEWS_CLEAN_CSV, index=False)
+    out.to_csv(C.NEWS_TFIDF_CSV, index=False)
 
     # --- laporan penyusutan --------------------------------------------------
     # Tabel ini langsung bisa disalin ke laporan PDF sebagai bukti pipeline.
@@ -256,10 +282,10 @@ def main():
         print(f"  {label:<48s} {n:>7,}  {pct}")
         prev = n
     print("-" * 55)
-    print(f"Tersimpan: {C.NEWS_CLEAN_CSV}")
+    print(f"Tersimpan: {C.NEWS_TFIDF_CSV}")
     print(f"Ditolak  : {C.NEWS_REJECTED_CSV}")
-    print(f"\nDistribusi per kelompok keyword:")
-    print(out["keyword_groups"].str.split("|").explode().value_counts().to_string())
+    print(f"\nTerm leksikon relevansi yang paling sering match (top 15):")
+    print(out["matched_terms"].str.split("|").explode().value_counts().head(15).to_string())
 
 
 if __name__ == "__main__":
