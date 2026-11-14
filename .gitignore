@@ -14,3 +14,28 @@ data/raw/checkpoints/
 # log
 logs/*
 !logs/.gitkeep
+
+# Hugging Face cache
+**/hf_cache/
+**/.cache/
+.cache/
+models--*/
+hub/
+
+# Large model artifacts
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+*.bin
+
+# OS
+.DS_Store
+EOF
+
+# Large FastText vector files
+models/fasttext_headline.model.wv.vectors_ngrams.npy
+models/fasttext_fulltext.model.wv.vectors_ngrams.npy
+
+# Large DTM binary model
+models/topic_modelling/dtm/dtm_model.bin
