@@ -1,0 +1,522 @@
+from pathlib import Path
+import json
+import re
+import warnings
+
+import numpy as np
+import pandas as pd
+
+# ----------------------------- CONFIGURATION -----------------------------
+
+ROOT = Path(__file__).resolve().parents[2]
+
+ALIGNED_DAILY_CSV = ROOT / "data/processed/aligned_daily.csv"
+
+EMBEDDING_FILES = {
+    # Non-contextual
+    "word2vec_fulltext": ROOT / "data/processed/word2vec_fulltext_features.csv",
+    "word2vec_headline": ROOT / "data/processed/word2vec_headline_features.csv",
+    "fasttext_fulltext": ROOT / "data/processed/fasttext_fulltext_features.csv",
+    "fasttext_headline": ROOT / "data/processed/fasttext_headline_features.csv",
+    "doc2vec_fulltext": ROOT / "data/processed/doc2vec_fulltext_features.csv",
+    "doc2vec_headline": ROOT / "data/processed/doc2vec_headline_features.csv",
+
+    # Contextual
+    "finbert_fulltext": ROOT / "data/processed/finbert_fulltext_features.csv",
+    "finbert_headline": ROOT / "data/processed/finbert_headline_features.csv",
+    "roberta_fulltext": ROOT / "data/processed/roberta_fulltext_features.csv",
+    "roberta_headline": ROOT / "data/processed/roberta_headline_features.csv",
+    "qwen_fulltext": ROOT / "data/processed/qwen_fulltext_features.csv",
+    "qwen_headline": ROOT / "data/processed/qwen_headline_features.csv",
+}
+
+# Optional metadata file. Leave as None if each embedding CSV already has
+# an event_category column.
+EVENT_METADATA_CSV = None
+# Example:
+# EVENT_METADATA_CSV = ROOT / "data/processed/ner/article_event_categories.csv"
+
+OUTPUT_DIR = ROOT / "data/processed/temporal_aggregation"
+MODEL_OUTPUT_DIR = ROOT / "models/temporal_aggregation"
+
+ROLLING_WINDOWS = [3, 5, 7, 14, 30]
+EXPONENTIAL_HALF_LIVES = [1, 3, 5, 7]
+
+# Chronological split for the supervised attention module.
+ATTENTION_TRAIN_RATIO = 0.80
+ATTENTION_EPOCHS = 100
+ATTENTION_LEARNING_RATE = 1e-3
+ATTENTION_WEIGHT_DECAY = 1e-4
+ATTENTION_RANDOM_SEED = 42
+
+# Use the existing direction labels; do not drop "flat".
+TARGET_CLASSES = ["down", "flat", "up"]
+
+# Event labels expected from NER/topic-model mapping. Other labels are retained
+# as "other" rather than silently discarded.
+EVENT_CATEGORIES = [
+    "military_conflict",
+    "economic_sanctions",
+    "trade_war",
+    "diplomatic_relations",
+    "central_bank_policy",
+    "other",
+]
+
+# ----------------------------- UTILITIES ---------------------------------
+
+def log(message):
+    print(f"[INFO] {message}", flush=True)
+
+
+def ensure_dirs():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    MODEL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def normalize_date(series):
+    return pd.to_datetime(series, errors="coerce").dt.normalize()
+
+
+def find_embedding_columns(df):
+    """
+    Prefer columns named emb_0, emb_1, ... .
+    If absent, use numeric columns except metadata/target fields.
+    """
+    emb_cols = [c for c in df.columns if re.fullmatch(r"(emb|embedding|vec|dim)[_-]?\d+", str(c), re.I)]
+    if emb_cols:
+        def sort_key(name):
+            m = re.search(r"(\d+)$", str(name))
+            return int(m.group(1)) if m else 0
+        return sorted(emb_cols, key=sort_key)
+
+    excluded = {
+        "date", "article_id", "url", "title", "headline", "text",
+        "event_category", "published_wib", "published_utc",
+        "target_date", "direction", "kurs", "log_return"
+    }
+    numeric_cols = [
+        c for c in df.columns
+        if c not in excluded and pd.api.types.is_numeric_dtype(df[c])
+    ]
+    if not numeric_cols:
+        raise ValueError(
+            "Tidak menemukan kolom embedding. Gunakan nama emb_0, emb_1, ... "
+            "atau pastikan kolom embedding bertipe numerik."
+        )
+    return numeric_cols
+
+
+def load_daily_calendar():
+    if not ALIGNED_DAILY_CSV.exists():
+        raise FileNotFoundError(f"File target tidak ditemukan: {ALIGNED_DAILY_CSV}")
+
+    daily = pd.read_csv(ALIGNED_DAILY_CSV)
+    required = {"date", "direction"}
+    missing = required - set(daily.columns)
+    if missing:
+        raise ValueError(f"Kolom wajib di aligned_daily.csv tidak ada: {sorted(missing)}")
+
+    daily["date"] = normalize_date(daily["date"])
+    daily = daily.dropna(subset=["date"]).sort_values("date").drop_duplicates("date")
+    daily["direction"] = daily["direction"].astype(str).str.lower().str.strip()
+
+    invalid = sorted(set(daily["direction"]) - set(TARGET_CLASSES))
+    if invalid:
+        raise ValueError(f"Label direction tidak dikenal: {invalid}. Label flat harus dipertahankan.")
+
+    return daily.reset_index(drop=True)
+
+
+def load_event_metadata():
+    if EVENT_METADATA_CSV is None:
+        return None
+    path = Path(EVENT_METADATA_CSV)
+    if not path.exists():
+        raise FileNotFoundError(f"Event metadata tidak ditemukan: {path}")
+    meta = pd.read_csv(path)
+    required = {"article_id", "event_category"}
+    missing = required - set(meta.columns)
+    if missing:
+        raise ValueError(f"Kolom metadata event harus memuat {sorted(required)}")
+    return meta[["article_id", "event_category"]].drop_duplicates("article_id")
+
+
+def load_article_embeddings(path, event_meta=None):
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"File embedding tidak ditemukan: {path}\n"
+            "Sesuaikan EMBEDDING_FILES dengan lokasi file embedding artikelmu."
+        )
+
+    df = pd.read_csv(path)
+    if "date" not in df.columns:
+        raise ValueError(f"{path.name}: wajib memiliki kolom date.")
+    if "article_id" not in df.columns:
+        # Fallback only if each row is one article. Stable ID is generated.
+        df["article_id"] = [f"article_{i}" for i in range(len(df))]
+
+    df["date"] = normalize_date(df["date"])
+    df = df.dropna(subset=["date"]).copy()
+
+    if "event_category" not in df.columns and event_meta is not None:
+        df = df.merge(event_meta, on="article_id", how="left")
+
+    if "event_category" not in df.columns:
+        df["event_category"] = "other"
+
+    df["event_category"] = (
+        df["event_category"].fillna("other").astype(str).str.lower().str.strip()
+    )
+    df.loc[df["event_category"].isin(["", "nan", "none", "null"]), "event_category"] = "other"
+    df.loc[~df["event_category"].isin(EVENT_CATEGORIES), "event_category"] = "other"
+
+    emb_cols = find_embedding_columns(df)
+    for col in emb_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df[emb_cols] = df[emb_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    if df.empty:
+        raise ValueError(f"Tidak ada baris embedding valid pada {path}")
+
+    # A duplicate article_id is not automatically removed because a source may
+    # legitimately provide multiple chunks. The expected contract is one row/article.
+    return df, emb_cols
+
+
+def save_features(df, path):
+    out = df.copy()
+    if "date" in out.columns:
+        out["date"] = pd.to_datetime(out["date"]).dt.strftime("%Y-%m-%d")
+    out.to_csv(path, index=False)
+
+
+def daily_mean(article_df, emb_cols, calendar):
+    grouped = article_df.groupby("date")[emb_cols].mean()
+    counts = article_df.groupby("date").size().rename("news_count")
+    out = calendar[["date"]].merge(grouped, left_on="date", right_index=True, how="left")
+    out = out.merge(counts, left_on="date", right_index=True, how="left")
+    out["news_count"] = out["news_count"].fillna(0).astype(int)
+    out[emb_cols] = out[emb_cols].fillna(0.0)
+    return out
+
+
+def rolling_mean_features(a0, emb_cols, window):
+    """
+    Trailing calendar-day window ending on date t.
+    min_periods=1 avoids dropping early dates. Missing-news dates are zero
+    vectors because the calendar was completed before rolling.
+    """
+    temp = a0.set_index("date")[emb_cols].sort_index()
+    rolled = temp.rolling(window=window, min_periods=1).mean()
+    rolled.columns = [f"{c}_roll{window}" for c in emb_cols]
+    return rolled.reset_index()
+
+
+def exponential_decay_features(a0, emb_cols, half_life):
+    """
+    Trailing calendar-day exponential decay.
+    Weight at lag j is 2 ** (-j / half_life).
+    """
+    values = a0.set_index("date")[emb_cols].sort_index()
+    matrix = values.to_numpy(dtype=np.float64)
+    result = np.zeros_like(matrix, dtype=np.float64)
+
+    # Recursive weighted mean. Equivalent to weights 2**(-lag/half_life)
+    # over the complete available history, but computed in O(n * dimension).
+    decay = 2.0 ** (-1.0 / float(half_life))
+    numerator = np.zeros(matrix.shape[1], dtype=np.float64)
+    denominator = 0.0
+
+    for i in range(len(matrix)):
+        numerator = matrix[i] + decay * numerator
+        denominator = 1.0 + decay * denominator
+        result[i] = numerator / denominator
+
+    out = pd.DataFrame(result, columns=[f"{c}_exp_hl{half_life}" for c in emb_cols])
+    out.insert(0, "date", values.index)
+    return out
+
+
+def event_aware_features(article_df, emb_cols, calendar):
+    """
+    Mean embedding and article count per event category per date.
+    Each category gets its own vector. Categories with no articles get zeros.
+    """
+    pieces = []
+    for category in EVENT_CATEGORIES:
+        subset = article_df[article_df["event_category"] == category]
+        if subset.empty:
+            grouped = pd.DataFrame(index=pd.DatetimeIndex([], name="date"), columns=emb_cols)
+            counts = pd.Series(dtype="int64", name=f"{category}_count")
+        else:
+            grouped = subset.groupby("date")[emb_cols].mean()
+            counts = subset.groupby("date").size().rename(f"{category}_count")
+
+        grouped.columns = [f"{category}_{c}" for c in emb_cols]
+        count_name = f"{category}_count"
+        if counts.empty:
+            count_df = pd.DataFrame(columns=[count_name])
+            count_df.index.name = "date"
+        else:
+            count_df = counts.to_frame()
+
+        piece = calendar[["date"]].merge(grouped, left_on="date", right_index=True, how="left")
+        piece = piece.merge(count_df, left_on="date", right_index=True, how="left")
+        feature_cols = [c for c in piece.columns if c != "date"]
+        piece[feature_cols] = piece[feature_cols].fillna(0.0)
+        piece[count_name] = piece[count_name].astype(int)
+        pieces.append(piece)
+
+    result = calendar[["date"]].copy()
+    for piece in pieces:
+        result = result.merge(piece, on="date", how="left")
+    return result
+
+
+# -------------------------- A3 ATTENTION ----------------------------------
+
+def attention_pooling(article_df, emb_cols, calendar, target_df, model_name):
+    """
+    Supervised single-query attention pooling.
+
+    The attention scorer and classifier are fitted ONLY on the chronological
+    training segment. The learned scorer is then applied to articles on every
+    date. The held-out tail is never used to fit attention parameters.
+
+    For a strict downstream CV study, move this fitting procedure inside each
+    outer temporal fold. This standalone script uses one chronological holdout.
+    """
+    try:
+        import torch
+        from torch import nn
+    except ImportError as exc:
+        raise ImportError("A3 membutuhkan PyTorch. Install torch di environment aktif.") from exc
+
+    torch.manual_seed(ATTENTION_RANDOM_SEED)
+    np.random.seed(ATTENTION_RANDOM_SEED)
+    # Automatically select the best available GPU
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+
+    log(f"A3 {model_name}: using device = {device}")
+
+    date_to_articles = {
+            d: g[emb_cols].to_numpy(dtype=np.float32)
+            for d, g in article_df.groupby("date")
+        }
+    dim = len(emb_cols)
+
+        # Only dates with at least one article are represented by a non-empty matrix.
+        # Empty-news dates are assigned a zero vector after pooling.
+    dates = calendar["date"].tolist()
+    y_map = target_df.set_index("date")["direction"].to_dict()
+    class_to_idx = {label: i for i, label in enumerate(TARGET_CLASSES)}
+
+    train_n = max(1, int(len(dates) * ATTENTION_TRAIN_RATIO))
+    train_dates = dates[:train_n]
+
+    train_x = []
+    train_y = []
+    train_date_list = []
+    for date in train_dates:
+        arr = date_to_articles.get(date)
+        label = y_map.get(date)
+        if arr is None or len(arr) == 0 or label not in class_to_idx:
+            continue
+        train_x.append(arr)
+        train_y.append(class_to_idx[label])
+        train_date_list.append(date)
+
+    if len(train_x) < 10:
+        raise ValueError(
+            f"A3 {model_name}: hanya {len(train_x)} tanggal training yang memiliki berita. "
+            "Periksa data artikel dan rasio split."
+        )
+
+    class AttentionPoolClassifier(nn.Module):
+        def __init__(self, input_dim, n_classes):
+            super().__init__()
+            self.projection = nn.Linear(input_dim, input_dim)
+            self.query = nn.Parameter(torch.randn(input_dim) * 0.02)
+            self.classifier = nn.Linear(input_dim, n_classes)
+
+        def pool(self, x):
+            # x: [n_articles, embedding_dim]
+            scores = torch.tanh(self.projection(x)) @ self.query
+            weights = torch.softmax(scores, dim=0)
+            pooled = torch.sum(weights.unsqueeze(1) * x, dim=0)
+            return pooled, weights
+
+        def forward(self, x):
+            pooled, weights = self.pool(x)
+            logits = self.classifier(pooled)
+            return logits, pooled, weights
+
+    model = AttentionPoolClassifier(dim, len(TARGET_CLASSES)).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=ATTENTION_LEARNING_RATE,
+        weight_decay=ATTENTION_WEIGHT_DECAY
+    )
+    criterion = nn.CrossEntropyLoss()
+
+    model.train()
+    for epoch in range(ATTENTION_EPOCHS):
+        total_loss = 0.0
+        order = np.random.permutation(len(train_x))
+        for idx in order:
+            x = torch.tensor(train_x[idx], dtype=torch.float32, device=device)
+            y = torch.tensor([train_y[idx]], dtype=torch.long, device=device)
+            optimizer.zero_grad()
+            logits, _, _ = model(x)
+            loss = criterion(logits.unsqueeze(0), y)
+            loss.backward()
+            optimizer.step()
+            total_loss += float(loss.detach().cpu())
+        if (epoch + 1) % 20 == 0:
+            log(f"A3 {model_name}: epoch {epoch + 1}/{ATTENTION_EPOCHS}, loss={total_loss / len(train_x):.5f}")
+
+    model.eval()
+    pooled_rows = []
+    attention_rows = []
+
+    with torch.no_grad():
+        for date in dates:
+            arr = date_to_articles.get(date)
+            if arr is None or len(arr) == 0:
+                pooled = np.zeros(dim, dtype=np.float32)
+                weights = np.array([], dtype=np.float32)
+                n_articles = 0
+            else:
+                x = torch.tensor(arr, dtype=torch.float32, device=device)
+                _, pooled_tensor, weights_tensor = model(x)
+                pooled = pooled_tensor.detach().cpu().numpy()
+                weights = weights_tensor.detach().cpu().numpy()
+                n_articles = len(arr)
+
+                attention_rows.append({
+                    "date": date,
+                    "n_articles": n_articles,
+                    "attention_weight_sum": float(weights.sum()),
+                    "attention_weight_max": float(weights.max()),
+                    "attention_weight_entropy": float(
+                        -(weights * np.log(weights + 1e-12)).sum()
+                    ),
+                })
+
+            pooled_rows.append([date, *pooled.tolist(), n_articles])
+
+    feature_cols = [f"{c}_attention" for c in emb_cols]
+    out = pd.DataFrame(pooled_rows, columns=["date", *feature_cols, "attention_news_count"])
+    diagnostics = pd.DataFrame(attention_rows)
+
+    model_path = MODEL_OUTPUT_DIR / f"{model_name}_a3_attention.pt"
+    torch.save(model.state_dict(), model_path)
+    diagnostics_path = OUTPUT_DIR / f"{model_name}_A3_attention_diagnostics.csv"
+    if not diagnostics.empty:
+        save_features(diagnostics, diagnostics_path)
+
+    return out
+
+
+# ------------------------------- MAIN -------------------------------------
+
+def run_for_model(model_name, embedding_path, calendar, event_meta):
+    log(f"Processing model: {model_name}")
+    articles, emb_cols = load_article_embeddings(embedding_path, event_meta)
+
+    # Ensure dates are limited to the target calendar. This also avoids
+    # accidentally extending the forecasting period with unrelated documents.
+    calendar_dates = set(calendar["date"])
+    articles = articles[articles["date"].isin(calendar_dates)].copy()
+
+    log(f"{model_name}: {len(articles):,} article rows, {len(emb_cols)} dimensions")
+
+    model_dir = OUTPUT_DIR / model_name
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    # A0: daily mean
+    a0 = daily_mean(articles, emb_cols, calendar)
+    save_features(a0, model_dir / f"{model_name}_A0_daily_mean.csv")
+
+    # A1: trailing rolling mean of A0
+    for window in ROLLING_WINDOWS:
+        a1 = rolling_mean_features(a0, emb_cols, window)
+        a1 = calendar[["date"]].merge(a1, on="date", how="left")
+        save_features(a1, model_dir / f"{model_name}_A1_rolling_{window}d.csv")
+
+    # A2: exponential decay of A0
+    for half_life in EXPONENTIAL_HALF_LIVES:
+        a2 = exponential_decay_features(a0, emb_cols, half_life)
+        save_features(a2, model_dir / f"{model_name}_A2_exp_decay_hl{half_life}d.csv")
+
+    # A3: learned attention over individual articles per date
+    target_df = calendar[["date", "direction"]].copy()
+    a3 = attention_pooling(articles, emb_cols, calendar, target_df, model_name)
+    save_features(a3, model_dir / f"{model_name}_A3_attention.csv")
+
+    # A4: event-aware mean vectors and event counts
+    a4 = event_aware_features(articles, emb_cols, calendar)
+    save_features(a4, model_dir / f"{model_name}_A4_event_aware.csv")
+
+    # Save a compact run summary
+    summary = {
+        "model": model_name,
+        "article_rows": int(len(articles)),
+        "embedding_dimension": int(len(emb_cols)),
+        "calendar_dates": int(len(calendar)),
+        "dates_with_news": int(articles["date"].nunique()),
+        "dates_without_news": int(len(calendar) - articles["date"].nunique()),
+        "event_categories": EVENT_CATEGORIES,
+        "rolling_windows_days": ROLLING_WINDOWS,
+        "exponential_half_lives_days": EXPONENTIAL_HALF_LIVES,
+        "attention_train_ratio": ATTENTION_TRAIN_RATIO,
+        "target_classes": TARGET_CLASSES,
+    }
+    with open(model_dir / f"{model_name}_run_metadata.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    log(f"Finished: {model_name}")
+
+
+def main():
+    ensure_dirs()
+    calendar = load_daily_calendar()
+    event_meta = load_event_metadata()
+
+    log(f"Calendar: {len(calendar):,} dates")
+    log(f"Direction distribution:\n{calendar['direction'].value_counts(dropna=False).to_string()}")
+
+    failures = []
+    for model_name, path in EMBEDDING_FILES.items():
+        try:
+            run_for_model(model_name, path, calendar, event_meta)
+        except Exception as exc:
+            failures.append((model_name, repr(exc)))
+            log(f"FAILED {model_name}: {exc}")
+
+    with open(OUTPUT_DIR / "run_failures.json", "w", encoding="utf-8") as f:
+        json.dump(
+            [{"model": name, "error": error} for name, error in failures],
+            f, ensure_ascii=False, indent=2
+        )
+
+    if failures:
+        print("\nSome models failed:")
+        for name, error in failures:
+            print(f"- {name}: {error}")
+        raise SystemExit(1)
+
+    log("All A0-A4 aggregations completed successfully.")
+    log(f"Feature outputs: {OUTPUT_DIR}")
+    log(f"Attention model weights: {MODEL_OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()

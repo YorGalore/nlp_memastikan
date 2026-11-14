@@ -1,0 +1,4 @@
+{
+  "device_detected": "mps",
+  "note": "LogisticRegression dari scikit-learn berjalan di CPU. A3 PyTorch dapat menggunakan Apple MPS."
+}
