@@ -1,0 +1,46 @@
+{
+  "model": "fasttext_headline",
+  "aggregation": "fasttext_headline_A2_exp_decay_hl7d.csv",
+  "fold": 1,
+  "train_samples": 100,
+  "test_samples": 200,
+  "n_features": 103,
+  "accuracy": 0.42,
+  "balanced_accuracy": 0.34204534204534204,
+  "macro_f1": 0.2968165093585026,
+  "macro_precision": 0.31183862433862436,
+  "macro_recall": 0.34204534204534204,
+  "mcc": 0.043703013553074765,
+  "training_seconds": 0.03060293197631836,
+  "class_labels": [
+    "low",
+    "medium",
+    "high"
+  ],
+  "confusion_matrix": [
+    [
+      73,
+      10,
+      8
+    ],
+    [
+      46,
+      6,
+      22
+    ],
+    [
+      25,
+      5,
+      5
+    ]
+  ],
+  "f1_low": 0.6212765957446809,
+  "precision_low": 0.5069444444444444,
+  "recall_low": 0.8021978021978022,
+  "f1_medium": 0.12631578947368421,
+  "precision_medium": 0.2857142857142857,
+  "recall_medium": 0.08108108108108109,
+  "f1_high": 0.14285714285714285,
+  "precision_high": 0.14285714285714285,
+  "recall_high": 0.14285714285714285
+}

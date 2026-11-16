@@ -14,20 +14,20 @@ ALIGNED_DAILY_CSV = ROOT / "data/processed/aligned_daily.csv"
 
 EMBEDDING_FILES = {
     # Non-contextual
-    "word2vec_fulltext": ROOT / "data/processed/word2vec_fulltext_features.csv",
-    "word2vec_headline": ROOT / "data/processed/word2vec_headline_features.csv",
-    "fasttext_fulltext": ROOT / "data/processed/fasttext_fulltext_features.csv",
-    "fasttext_headline": ROOT / "data/processed/fasttext_headline_features.csv",
-    "doc2vec_fulltext": ROOT / "data/processed/doc2vec_fulltext_features.csv",
-    "doc2vec_headline": ROOT / "data/processed/doc2vec_headline_features.csv",
+    "word2vec_fulltext": ROOT / "data/processed/head_vs_full/fulltext/word2vec_fulltext_features.csv",
+    "word2vec_headline": ROOT / "data/processed/head_vs_full/headline/word2vec_headline_features.csv",
+    "fasttext_fulltext": ROOT / "data/processed/head_vs_full/fulltext/fasttext_fulltext_features.csv",
+    "fasttext_headline": ROOT / "data/processed/head_vs_full/headline/fasttext_headline_features.csv",
+    "doc2vec_fulltext": ROOT / "data/processed/head_vs_full/fulltext/doc2vec_fulltext_features.csv",
+    "doc2vec_headline": ROOT / "data/processed/head_vs_full/headline/doc2vec_headline_features.csv",
 
     # Contextual
-    "finbert_fulltext": ROOT / "data/processed/finbert_fulltext_features.csv",
-    "finbert_headline": ROOT / "data/processed/finbert_headline_features.csv",
-    "roberta_fulltext": ROOT / "data/processed/roberta_fulltext_features.csv",
-    "roberta_headline": ROOT / "data/processed/roberta_headline_features.csv",
-    "qwen_fulltext": ROOT / "data/processed/qwen_fulltext_features.csv",
-    "qwen_headline": ROOT / "data/processed/qwen_headline_features.csv",
+    "finbert_fulltext": ROOT / "data/processed/head_vs_full/fulltext/finbert_fulltext_features.csv",
+    "finbert_headline": ROOT / "data/processed/head_vs_full/headline/finbert_headline_features.csv",
+    "roberta_fulltext": ROOT / "data/processed/head_vs_full/fulltext/roberta_fulltext_features.csv",
+    "roberta_headline": ROOT / "data/processed/head_vs_full/headline/roberta_headline_features.csv",
+    "qwen_fulltext": ROOT / "data/processed/head_vs_full/fulltext/qwen_fulltext_features.csv",
+    "qwen_headline": ROOT / "data/processed/head_vs_full/headline/qwen_headline_features.csv",
 }
 
 # Optional metadata file. Leave as None if each embedding CSV already has
@@ -49,8 +49,15 @@ ATTENTION_LEARNING_RATE = 1e-3
 ATTENTION_WEIGHT_DECAY = 1e-4
 ATTENTION_RANDOM_SEED = 42
 
-# Use the existing direction labels; do not drop "flat".
-TARGET_CLASSES = ["down", "flat", "up"]
+# Target from the project report: 3-class realized-volatility label.
+# aligned_daily.csv must already contain volatility_class, generated using:
+# - realized_vol(t) = std of the last 5 BI business-day log returns (incl. t)
+# - pd.qcut thresholds estimated from the earliest 70% of calendar observations
+# - the same fixed thresholds applied to the full chronological period
+# If volatility_class is absent, this script derives it from realized_vol
+# with the exact same earliest-70%-calendar rule before any news filtering.
+TARGET_COLUMN = "volatility_class"
+TARGET_CLASSES = ["low", "medium", "high"]
 
 # Event labels expected from NER/topic-model mapping. Other labels are retained
 # as "other" rather than silently discarded.
@@ -93,7 +100,7 @@ def find_embedding_columns(df):
     excluded = {
         "date", "article_id", "url", "title", "headline", "text",
         "event_category", "published_wib", "published_utc",
-        "target_date", "direction", "kurs", "log_return"
+        "target_date", "direction", "volatility_class", "realized_vol", "kurs", "log_return"
     }
     numeric_cols = [
         c for c in df.columns
@@ -107,23 +114,107 @@ def find_embedding_columns(df):
     return numeric_cols
 
 
+def add_volatility_class_from_report(df, source_name="aligned_daily.csv"):
+    """
+    Create volatility_class only when it is absent, following the project report.
+
+    The qcut boundaries are estimated from realized_vol in the earliest 70%
+    of the complete chronological calendar (before any no-news filtering),
+    then fixed and applied to the full period.
+    """
+    if TARGET_COLUMN in df.columns:
+        return df, None
+
+    if "realized_vol" not in df.columns:
+        raise ValueError(
+            f"{source_name} belum memiliki kolom {TARGET_COLUMN!r} maupun "
+            "realized_vol. Target volatilitas tidak dapat dibentuk. "
+            "Pastikan aligned_daily.csv memuat realized_vol sesuai definisi laporan."
+        )
+
+    realized_vol = pd.to_numeric(df["realized_vol"], errors="coerce")
+    reference_size = int(len(df) * 0.70)
+    if reference_size < 3:
+        raise ValueError(
+            f"Data terlalu sedikit untuk membentuk tertile: {len(df)} observasi kalender."
+        )
+
+    reference = realized_vol.iloc[:reference_size].dropna()
+    if reference.nunique() < 3:
+        raise ValueError(
+            "Nilai realized_vol pada 70% observasi kalender paling awal "
+            "tidak memiliki minimal tiga nilai unik; pd.qcut tidak dapat "
+            "membentuk tiga kelas volatilitas."
+        )
+
+    try:
+        _, bin_edges = pd.qcut(
+            reference,
+            q=3,
+            labels=TARGET_CLASSES,
+            retbins=True,
+            duplicates="raise",
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "Gagal membentuk tertile volatility_class dari 70% observasi "
+            f"kalender paling awal: {exc}"
+        ) from exc
+
+    if len(bin_edges) != 4:
+        raise ValueError(
+            f"pd.qcut menghasilkan {len(bin_edges) - 1} interval, "
+            "padahal laporan menetapkan tiga kelas (low/medium/high)."
+        )
+
+    lower_threshold = float(bin_edges[1])
+    upper_threshold = float(bin_edges[2])
+    df = df.copy()
+    df["realized_vol"] = realized_vol
+    df[TARGET_COLUMN] = pd.cut(
+        realized_vol,
+        bins=[-np.inf, lower_threshold, upper_threshold, np.inf],
+        labels=TARGET_CLASSES,
+        include_lowest=True,
+    )
+
+    print(
+        "[INFO] volatility_class dibuat dari realized_vol menggunakan "
+        "pd.qcut pada 70% kalender paling awal: "
+        f"threshold_1={lower_threshold:.8f}, "
+        f"threshold_2={upper_threshold:.8f}",
+        flush=True,
+    )
+    return df, (lower_threshold, upper_threshold)
+
+
 def load_daily_calendar():
     if not ALIGNED_DAILY_CSV.exists():
         raise FileNotFoundError(f"File target tidak ditemukan: {ALIGNED_DAILY_CSV}")
 
     daily = pd.read_csv(ALIGNED_DAILY_CSV)
-    required = {"date", "direction"}
-    missing = required - set(daily.columns)
-    if missing:
-        raise ValueError(f"Kolom wajib di aligned_daily.csv tidak ada: {sorted(missing)}")
+    if "date" not in daily.columns:
+        raise ValueError("Kolom wajib 'date' tidak ada di aligned_daily.csv")
 
     daily["date"] = normalize_date(daily["date"])
     daily = daily.dropna(subset=["date"]).sort_values("date").drop_duplicates("date")
-    daily["direction"] = daily["direction"].astype(str).str.lower().str.strip()
+    # Generate the report-defined label if the upstream file only has realized_vol.
+    daily, _ = add_volatility_class_from_report(daily)
+    # Preserve missing labels (e.g., the first four observations before a
+    # complete 5-day realized-volatility window exists). They are excluded from
+    # supervised A3 training, but their dates remain in the calendar.
+    daily[TARGET_COLUMN] = (
+        daily[TARGET_COLUMN].astype("string").str.lower().str.strip()
+    )
 
-    invalid = sorted(set(daily["direction"]) - set(TARGET_CLASSES))
+    invalid = sorted(
+        set(daily[TARGET_COLUMN].dropna().unique()) - set(TARGET_CLASSES)
+    )
     if invalid:
-        raise ValueError(f"Label direction tidak dikenal: {invalid}. Label flat harus dipertahankan.")
+        raise ValueError(
+            f"Label {TARGET_COLUMN} tidak dikenal: {invalid}. "
+            f"Label yang diperbolehkan: {TARGET_CLASSES}"
+        )
 
     return daily.reset_index(drop=True)
 
@@ -315,7 +406,7 @@ def attention_pooling(article_df, emb_cols, calendar, target_df, model_name):
         # Only dates with at least one article are represented by a non-empty matrix.
         # Empty-news dates are assigned a zero vector after pooling.
     dates = calendar["date"].tolist()
-    y_map = target_df.set_index("date")["direction"].to_dict()
+    y_map = target_df.set_index("date")[TARGET_COLUMN].to_dict()
     class_to_idx = {label: i for i, label in enumerate(TARGET_CLASSES)}
 
     train_n = max(1, int(len(dates) * ATTENTION_TRAIN_RATIO))
@@ -327,7 +418,7 @@ def attention_pooling(article_df, emb_cols, calendar, target_df, model_name):
     for date in train_dates:
         arr = date_to_articles.get(date)
         label = y_map.get(date)
-        if arr is None or len(arr) == 0 or label not in class_to_idx:
+        if arr is None or len(arr) == 0 or pd.isna(label) or label not in class_to_idx:
             continue
         train_x.append(arr)
         train_y.append(class_to_idx[label])
@@ -457,7 +548,7 @@ def run_for_model(model_name, embedding_path, calendar, event_meta):
         save_features(a2, model_dir / f"{model_name}_A2_exp_decay_hl{half_life}d.csv")
 
     # A3: learned attention over individual articles per date
-    target_df = calendar[["date", "direction"]].copy()
+    target_df = calendar[["date", TARGET_COLUMN]].copy()
     a3 = attention_pooling(articles, emb_cols, calendar, target_df, model_name)
     save_features(a3, model_dir / f"{model_name}_A3_attention.csv")
 
@@ -477,6 +568,7 @@ def run_for_model(model_name, embedding_path, calendar, event_meta):
         "rolling_windows_days": ROLLING_WINDOWS,
         "exponential_half_lives_days": EXPONENTIAL_HALF_LIVES,
         "attention_train_ratio": ATTENTION_TRAIN_RATIO,
+        "target_column": TARGET_COLUMN,
         "target_classes": TARGET_CLASSES,
     }
     with open(model_dir / f"{model_name}_run_metadata.json", "w", encoding="utf-8") as f:
@@ -491,7 +583,7 @@ def main():
     event_meta = load_event_metadata()
 
     log(f"Calendar: {len(calendar):,} dates")
-    log(f"Direction distribution:\n{calendar['direction'].value_counts(dropna=False).to_string()}")
+    log(f"{TARGET_COLUMN} distribution:\n{calendar[TARGET_COLUMN].value_counts(dropna=False).to_string()}")
 
     failures = []
     for model_name, path in EMBEDDING_FILES.items():

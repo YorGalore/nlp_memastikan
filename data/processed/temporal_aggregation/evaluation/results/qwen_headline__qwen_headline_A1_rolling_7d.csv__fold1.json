@@ -1,0 +1,46 @@
+{
+  "model": "qwen_headline",
+  "aggregation": "qwen_headline_A1_rolling_7d.csv",
+  "fold": 1,
+  "train_samples": 100,
+  "test_samples": 200,
+  "n_features": 896,
+  "accuracy": 0.315,
+  "balanced_accuracy": 0.276002376002376,
+  "macro_f1": 0.2440898345153664,
+  "macro_precision": 0.2797146892655367,
+  "macro_recall": 0.276002376002376,
+  "mcc": -0.08907388814361013,
+  "training_seconds": 0.041346073150634766,
+  "class_labels": [
+    "low",
+    "medium",
+    "high"
+  ],
+  "confusion_matrix": [
+    [
+      51,
+      5,
+      35
+    ],
+    [
+      52,
+      5,
+      17
+    ],
+    [
+      22,
+      6,
+      7
+    ]
+  ],
+  "f1_low": 0.4722222222222222,
+  "precision_low": 0.408,
+  "recall_low": 0.5604395604395604,
+  "f1_medium": 0.1111111111111111,
+  "precision_medium": 0.3125,
+  "recall_medium": 0.06756756756756757,
+  "f1_high": 0.14893617021276595,
+  "precision_high": 0.11864406779661017,
+  "recall_high": 0.2
+}

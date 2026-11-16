@@ -1,0 +1,46 @@
+{
+  "model": "roberta_fulltext",
+  "aggregation": "roberta_fulltext_A1_rolling_5d.csv",
+  "fold": 4,
+  "train_samples": 700,
+  "test_samples": 200,
+  "n_features": 768,
+  "accuracy": 0.38,
+  "balanced_accuracy": 0.3463718971631205,
+  "macro_f1": 0.2805347145523099,
+  "macro_precision": 0.3180477528089887,
+  "macro_recall": 0.3463718971631205,
+  "mcc": 0.032411014638054826,
+  "training_seconds": 0.2423248291015625,
+  "class_labels": [
+    "low",
+    "medium",
+    "high"
+  ],
+  "confusion_matrix": [
+    [
+      13,
+      4,
+      8
+    ],
+    [
+      25,
+      2,
+      20
+    ],
+    [
+      58,
+      9,
+      61
+    ]
+  ],
+  "f1_low": 0.21487603305785125,
+  "precision_low": 0.13541666666666666,
+  "recall_low": 0.52,
+  "f1_medium": 0.06451612903225806,
+  "precision_medium": 0.13333333333333333,
+  "recall_medium": 0.0425531914893617,
+  "f1_high": 0.5622119815668203,
+  "precision_high": 0.6853932584269663,
+  "recall_high": 0.4765625
+}

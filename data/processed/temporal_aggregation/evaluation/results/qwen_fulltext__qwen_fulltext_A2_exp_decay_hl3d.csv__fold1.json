@@ -1,0 +1,46 @@
+{
+  "model": "qwen_fulltext",
+  "aggregation": "qwen_fulltext_A2_exp_decay_hl3d.csv",
+  "fold": 1,
+  "train_samples": 100,
+  "test_samples": 200,
+  "n_features": 896,
+  "accuracy": 0.3,
+  "balanced_accuracy": 0.2567765567765568,
+  "macro_f1": 0.2342390094360037,
+  "macro_precision": 0.23690371671056484,
+  "macro_recall": 0.2567765567765568,
+  "mcc": -0.14748957206776822,
+  "training_seconds": 0.055841922760009766,
+  "class_labels": [
+    "low",
+    "medium",
+    "high"
+  ],
+  "confusion_matrix": [
+    [
+      22,
+      59,
+      10
+    ],
+    [
+      34,
+      37,
+      3
+    ],
+    [
+      11,
+      23,
+      1
+    ]
+  ],
+  "f1_low": 0.27848101265822783,
+  "precision_low": 0.3283582089552239,
+  "recall_low": 0.24175824175824176,
+  "f1_medium": 0.38341968911917096,
+  "precision_medium": 0.31092436974789917,
+  "recall_medium": 0.5,
+  "f1_high": 0.04081632653061224,
+  "precision_high": 0.07142857142857142,
+  "recall_high": 0.02857142857142857
+}

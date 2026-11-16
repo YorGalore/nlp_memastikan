@@ -1,0 +1,46 @@
+{
+  "model": "finbert_fulltext",
+  "aggregation": "finbert_fulltext_A1_rolling_5d.csv",
+  "fold": 2,
+  "train_samples": 300,
+  "test_samples": 200,
+  "n_features": 768,
+  "accuracy": 0.37,
+  "balanced_accuracy": 0.35715137109722833,
+  "macro_f1": 0.3584415584415584,
+  "macro_precision": 0.3656752394726362,
+  "macro_recall": 0.35715137109722833,
+  "mcc": 0.05139300083504137,
+  "training_seconds": 0.07799887657165527,
+  "class_labels": [
+    "low",
+    "medium",
+    "high"
+  ],
+  "confusion_matrix": [
+    [
+      12,
+      24,
+      17
+    ],
+    [
+      26,
+      30,
+      13
+    ],
+    [
+      19,
+      27,
+      32
+    ]
+  ],
+  "f1_low": 0.21818181818181817,
+  "precision_low": 0.21052631578947367,
+  "recall_low": 0.22641509433962265,
+  "f1_medium": 0.4,
+  "precision_medium": 0.37037037037037035,
+  "recall_medium": 0.43478260869565216,
+  "f1_high": 0.45714285714285713,
+  "precision_high": 0.5161290322580645,
+  "recall_high": 0.41025641025641024
+}

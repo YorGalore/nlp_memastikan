@@ -1,0 +1,37 @@
+{
+  "target_file": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/aligned_daily.csv",
+  "output_dir": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/contextual_embedding_volatility_evaluation",
+  "n_target_rows": 1197,
+  "target_class_distribution": {
+    "low": 410,
+    "high": 402,
+    "medium": 385
+  },
+  "n_splits": 5,
+  "split_strategy": "TimeSeriesSplit (chronological; no random shuffle)",
+  "classification_model": "StandardScaler + LogisticRegression(class_weight='balanced', L2)",
+  "regression_model": "StandardScaler + Ridge on realized_vol",
+  "logistic_C": 1.0,
+  "ridge_alpha": 1.0,
+  "model_groups": {
+    "finbert": "domain_specific",
+    "roberta": "general_purpose",
+    "qwen": "general_purpose"
+  },
+  "market_lag_columns": [
+    "lag1_log_return",
+    "lag2_log_return",
+    "lag3_log_return",
+    "lag1_realized_vol"
+  ],
+  "feature_files": {
+    "qwen_headline": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/head_vs_full/headline/qwen_headline_features.csv",
+    "finbert_headline": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/head_vs_full/headline/finbert_headline_features.csv",
+    "roberta_headline": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/head_vs_full/headline/roberta_headline_features.csv",
+    "roberta_fulltext": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/head_vs_full/fulltext/roberta_fulltext_features.csv",
+    "finbert_fulltext": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/head_vs_full/fulltext/finbert_fulltext_features.csv",
+    "qwen_fulltext": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/head_vs_full/fulltext/qwen_fulltext_features.csv"
+  },
+  "target_definition": "realized_vol(t) = rolling standard deviation of the latest five BI business-day log returns, including t; volatility_class uses tertile thresholds fitted on earliest 70% of chronological observations.",
+  "note": "FinBERT is grouped as domain-specific; RoBERTa and Qwen as general-purpose. Group comparison is descriptive and does not isolate domain specialization from architecture, model size, pretraining corpus, or embedding extraction choices. The low/medium/high volatility classes are retained."
+}

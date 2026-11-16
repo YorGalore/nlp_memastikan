@@ -1,0 +1,46 @@
+{
+  "model": "word2vec_headline",
+  "aggregation": "word2vec_headline_A2_exp_decay_hl3d.csv",
+  "fold": 4,
+  "train_samples": 700,
+  "test_samples": 200,
+  "n_features": 103,
+  "accuracy": 0.175,
+  "balanced_accuracy": 0.3468927304964539,
+  "macro_f1": 0.14717537329397168,
+  "macro_precision": 0.33035923141186296,
+  "macro_recall": 0.3468927304964539,
+  "mcc": -0.0065156318244555984,
+  "training_seconds": 0.10392904281616211,
+  "class_labels": [
+    "low",
+    "medium",
+    "high"
+  ],
+  "confusion_matrix": [
+    [
+      23,
+      0,
+      2
+    ],
+    [
+      38,
+      2,
+      7
+    ],
+    [
+      114,
+      4,
+      10
+    ]
+  ],
+  "f1_low": 0.23,
+  "precision_low": 0.13142857142857142,
+  "recall_low": 0.92,
+  "f1_medium": 0.07547169811320754,
+  "precision_medium": 0.3333333333333333,
+  "recall_medium": 0.0425531914893617,
+  "f1_high": 0.1360544217687075,
+  "precision_high": 0.5263157894736842,
+  "recall_high": 0.078125
+}

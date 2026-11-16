@@ -1,0 +1,46 @@
+{
+  "model": "doc2vec_headline",
+  "aggregation": "doc2vec_headline_A3_attention.csv",
+  "fold": 4,
+  "train_samples": 700,
+  "test_samples": 200,
+  "n_features": 102,
+  "accuracy": 0.275,
+  "balanced_accuracy": 0.3467331560283688,
+  "macro_f1": 0.2523553441863301,
+  "macro_precision": 0.3549766583054626,
+  "macro_recall": 0.3467331560283688,
+  "mcc": 0.024323427285227996,
+  "training_seconds": 0.10702085494995117,
+  "class_labels": [
+    "low",
+    "medium",
+    "high"
+  ],
+  "confusion_matrix": [
+    [
+      6,
+      19,
+      0
+    ],
+    [
+      8,
+      31,
+      8
+    ],
+    [
+      32,
+      78,
+      18
+    ]
+  ],
+  "f1_low": 0.16901408450704225,
+  "precision_low": 0.13043478260869565,
+  "recall_low": 0.24,
+  "f1_medium": 0.35428571428571426,
+  "precision_medium": 0.2421875,
+  "recall_medium": 0.6595744680851063,
+  "f1_high": 0.23376623376623376,
+  "precision_high": 0.6923076923076923,
+  "recall_high": 0.140625
+}

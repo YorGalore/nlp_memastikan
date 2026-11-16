@@ -29,7 +29,7 @@ warnings.filterwarnings("ignore")
 ROOT_DIR = Path(__file__).resolve().parents[3]
 
 DATA_DIR = ROOT_DIR / "data" / "processed"
-OUTPUT_DIR = DATA_DIR / "headlineVsFulltext"
+OUTPUT_DIR = DATA_DIR / "head_vs_full"
 
 ALIGNED_PATH = DATA_DIR / "aligned_daily.csv"
 
@@ -38,30 +38,32 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 TEST_SIZE = 0.20
 RANDOM_STATE = 42
 
-# Three-class classification
+# Three-class volatility classification
+# Class order is kept consistent across labels, metrics, and probabilities.
+TARGET_COLUMN = "volatility_class"
 CLASS_MAPPING = {
-    "down": 0,
-    "up": 1,
-    "flat": 2,
+    "low": 0,
+    "medium": 1,
+    "high": 2,
 }
 
-CLASS_NAMES = ["down", "up", "flat"]
+CLASS_NAMES = ["low", "medium", "high"]
 CLASS_LABELS = [0, 1, 2]
 
 EXPERIMENTS = {
-    "word2vec_headline": "word2vec_headline_features.csv",
-    "fasttext_headline": "fasttext_headline_features.csv",
-    "doc2vec_headline": "doc2vec_headline_features.csv",
-    "finbert_headline": "finbert_headline_features.csv",
-    "qwen_headline": "qwen_headline_features.csv",
-    "roberta_headline": "roberta_headline_features.csv",
+    "word2vec_headline": "head_vs_full/headline/word2vec_headline_features.csv",
+    "fasttext_headline": "head_vs_full/headline/fasttext_headline_features.csv",
+    "doc2vec_headline": "head_vs_full/headline/doc2vec_headline_features.csv",
+    "finbert_headline": "head_vs_full/headline/finbert_headline_features.csv",
+    "qwen_headline": "head_vs_full/headline/qwen_headline_features.csv",
+    "roberta_headline": "head_vs_full/headline/roberta_headline_features.csv",
 
-    "word2vec_fulltext": "word2vec_fulltext_features.csv",
-    "fasttext_fulltext": "fasttext_fulltext_features.csv",
-    "doc2vec_fulltext": "doc2vec_fulltext_features.csv",
-    "finbert_fulltext": "finbert_fulltext_features.csv",
-    "qwen_fulltext": "qwen_fulltext_features.csv",
-    "roberta_fulltext": "roberta_fulltext_features.csv",
+    "word2vec_fulltext": "head_vs_full/fulltext/word2vec_fulltext_features.csv",
+    "fasttext_fulltext": "head_vs_full/fulltext/fasttext_fulltext_features.csv",
+    "doc2vec_fulltext": "head_vs_full/fulltext/doc2vec_fulltext_features.csv",
+    "finbert_fulltext": "head_vs_full/fulltext/finbert_fulltext_features.csv",
+    "qwen_fulltext": "head_vs_full/fulltext/qwen_fulltext_features.csv",
+    "roberta_fulltext": "head_vs_full/fulltext/roberta_fulltext_features.csv",
 }
 
 
@@ -70,40 +72,111 @@ EXPERIMENTS = {
 # ============================================================
 
 def normalize_target(series):
-    """
-    Three-class classification:
-        down / turun = 0
-        up / naik    = 1
-        flat / datar = 2
-    """
+    """Map low/medium/high volatility labels to 0/1/2; retain missing labels."""
 
-    text = series.astype(str).str.strip().str.lower()
-
+    text = series.astype("string").str.strip().str.lower()
     mapping = {
-        "down": 0,
-        "downward": 0,
-        "turun": 0,
-        "negative": 0,
-
-        "up": 1,
-        "upward": 1,
-        "naik": 1,
-        "positive": 1,
-
-        "flat": 2,
-        "datar": 2,
-        "neutral": 2,
+        "low": 0,
+        "medium": 1,
+        "high": 2,
+        # Also accept already encoded class values.
+        "0": 0,
+        "1": 1,
+        "2": 2,
     }
 
     result = text.map(mapping)
+    unknown_mask = text.notna() & result.isna()
 
-    if result.isna().any():
-        unknown = text[result.isna()].unique()
+    if unknown_mask.any():
+        unknown = text[unknown_mask].unique()
         raise ValueError(
-            f"Nilai direction tidak dikenali: {unknown}"
+            f"Nilai {TARGET_COLUMN} tidak dikenali: {unknown}. "
+            "Label yang valid: low, medium, high."
         )
 
-    return result.astype(int)
+    return result.astype("Int64")
+
+
+def ensure_volatility_target(aligned):
+    """Use report-defined volatility classes, deriving them only if needed.
+
+    Target definition:
+      1. realized_vol = standard deviation of the latest five BI business-day
+         log returns, including the current day.
+      2. The low/medium/high cutoffs are tertiles calibrated on the earliest
+         70% of chronological observations and then applied to the full series.
+
+    If volatility_class is already present, it is used as-is after normalization.
+    """
+
+    aligned = aligned.sort_values("date").reset_index(drop=True).copy()
+
+    if TARGET_COLUMN not in aligned.columns:
+        if "realized_vol" not in aligned.columns:
+            if "log_return" not in aligned.columns:
+                raise ValueError(
+                    "Kolom 'volatility_class' tidak ditemukan. Untuk membentuk "
+                    "target sesuai definisi laporan, aligned_daily.csv harus "
+                    "memiliki kolom 'realized_vol' atau 'log_return'."
+                )
+
+            log_returns = pd.to_numeric(
+                aligned["log_return"], errors="coerce"
+            )
+            aligned["realized_vol"] = log_returns.rolling(
+                window=5, min_periods=5
+            ).std()
+
+        realized_vol = pd.to_numeric(
+            aligned["realized_vol"], errors="coerce"
+        )
+        calibration_end = int(len(aligned) * 0.70)
+        calibration = realized_vol.iloc[:calibration_end].dropna()
+
+        if len(calibration) < 3:
+            raise ValueError(
+                "Observasi realized_vol pada 70% periode awal tidak cukup "
+                "untuk membentuk tiga kelas volatilitas."
+            )
+
+        try:
+            _, bin_edges = pd.qcut(
+                calibration,
+                q=3,
+                labels=CLASS_NAMES,
+                retbins=True,
+                duplicates="raise",
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "Tertile volatility tidak dapat dibentuk menjadi tiga kelas "
+                "(kemungkinan banyak nilai realized_vol yang sama). "
+                "Periksa distribusi realized_vol."
+            ) from exc
+
+        if len(bin_edges) != 4 or not bin_edges[1] < bin_edges[2]:
+            raise ValueError(
+                "Threshold low/medium/high tidak menghasilkan tiga kelas "
+                "yang berbeda. Periksa distribusi realized_vol."
+            )
+
+        aligned[TARGET_COLUMN] = pd.cut(
+            realized_vol,
+            bins=[-np.inf, bin_edges[1], bin_edges[2], np.inf],
+            labels=CLASS_NAMES,
+            include_lowest=True,
+        )
+
+        print("Volatility target derived from realized_vol.")
+        print(f"Calibration period: earliest {calibration_end} observations")
+        print(f"Low/Medium threshold : {bin_edges[1]:.10f}")
+        print(f"Medium/High threshold: {bin_edges[2]:.10f}")
+    else:
+        print("Using existing volatility_class column from aligned_daily.csv.")
+
+    aligned[TARGET_COLUMN] = normalize_target(aligned[TARGET_COLUMN])
+    return aligned
 
 
 # ============================================================
@@ -213,7 +286,7 @@ def calculate_metrics(y_true, y_pred, y_prob):
 # ============================================================
 
 print("=" * 65)
-print("LOADING TARGET DATA")
+print("LOADING VOLATILITY TARGET DATA")
 print("=" * 65)
 
 if not ALIGNED_PATH.exists():
@@ -223,31 +296,20 @@ if not ALIGNED_PATH.exists():
 
 aligned = pd.read_csv(ALIGNED_PATH)
 
-required_columns = ["date", "direction"]
-
-for col in required_columns:
-    if col not in aligned.columns:
-        raise ValueError(
-            f"Kolom '{col}' tidak ditemukan di aligned_daily.csv"
-        )
+if "date" not in aligned.columns:
+    raise ValueError("Kolom 'date' tidak ditemukan di aligned_daily.csv")
 
 aligned["date"] = pd.to_datetime(
     aligned["date"],
     errors="coerce",
 )
+aligned = aligned.dropna(subset=["date"]).copy()
+aligned = ensure_volatility_target(aligned)
 
-aligned = aligned.dropna(
-    subset=["date", "direction"]
-).copy()
-
-# Keep all three classes
-aligned["direction"] = normalize_target(
-    aligned["direction"]
-)
-
-aligned = aligned.sort_values(
-    "date"
-).reset_index(drop=True)
+# Drop dates where the five-day realized-volatility target is not available.
+aligned = aligned.dropna(subset=[TARGET_COLUMN]).copy()
+aligned[TARGET_COLUMN] = aligned[TARGET_COLUMN].astype(int)
+aligned = aligned.sort_values("date").reset_index(drop=True)
 
 if aligned["date"].duplicated().any():
     raise ValueError(
@@ -256,13 +318,13 @@ if aligned["date"].duplicated().any():
 
 print(f"Total observations: {len(aligned)}")
 
-print("\nClass distribution:")
+print("\nVolatility class distribution:")
 print(
-    aligned["direction"]
+    aligned[TARGET_COLUMN]
     .map({
-        0: "Down",
-        1: "Up",
-        2: "Flat",
+        0: "Low",
+        1: "Medium",
+        2: "High",
     })
     .value_counts()
 )
@@ -363,7 +425,7 @@ for experiment_name, filename in EXPERIMENTS.items():
     # --------------------------------------------------------
 
     dataset = aligned[
-        ["date", "direction"]
+        ["date", TARGET_COLUMN]
     ].merge(
         features[["date"] + feature_columns],
         on="date",
@@ -405,10 +467,10 @@ for experiment_name, filename in EXPERIMENTS.items():
         continue
 
     X_train = train_data[feature_columns]
-    y_train = train_data["direction"]
+    y_train = train_data[TARGET_COLUMN]
 
     X_test = test_data[feature_columns]
-    y_test = test_data["direction"]
+    y_test = test_data[TARGET_COLUMN]
 
     if set(CLASS_LABELS) - set(y_train.unique()):
         print(
@@ -497,9 +559,9 @@ for experiment_name, filename in EXPERIMENTS.items():
         "n_features": len(feature_columns),
         "train_samples": len(X_train),
         "test_samples": len(X_test),
-        "down_test": int((y_test == 0).sum()),
-        "up_test": int((y_test == 1).sum()),
-        "flat_test": int((y_test == 2).sum()),
+        "low_test": int((y_test == 0).sum()),
+        "medium_test": int((y_test == 1).sum()),
+        "high_test": int((y_test == 2).sum()),
         "zero_embedding_dates": int(missing_embedding_dates),
         **metrics,
     }
@@ -515,9 +577,9 @@ for experiment_name, filename in EXPERIMENTS.items():
         "experiment": experiment_name,
         "y_true": y_test.values,
         "y_pred": y_pred,
-        "prob_down": y_prob[:, 0],
-        "prob_up": y_prob[:, 1],
-        "prob_flat": y_prob[:, 2],
+        "prob_low": y_prob[:, 0],
+        "prob_medium": y_prob[:, 1],
+        "prob_high": y_prob[:, 2],
     })
 
     all_predictions.append(predictions)
@@ -581,7 +643,7 @@ print(
         y_test,
         y_pred,
         labels=[0, 1, 2],
-        target_names=["Down", "Up", "Flat"],
+        target_names=["Low", "Medium", "High"],
         zero_division=0
     )
 )

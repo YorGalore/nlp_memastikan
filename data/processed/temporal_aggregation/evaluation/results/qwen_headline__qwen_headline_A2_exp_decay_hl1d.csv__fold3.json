@@ -1,0 +1,46 @@
+{
+  "model": "qwen_headline",
+  "aggregation": "qwen_headline_A2_exp_decay_hl1d.csv",
+  "fold": 3,
+  "train_samples": 500,
+  "test_samples": 200,
+  "n_features": 896,
+  "accuracy": 0.255,
+  "balanced_accuracy": 0.25286326985760854,
+  "macro_f1": 0.1971038870808498,
+  "macro_precision": 0.1946078431372549,
+  "macro_recall": 0.25286326985760854,
+  "mcc": -0.14592961773063573,
+  "training_seconds": 0.13729619979858398,
+  "class_labels": [
+    "low",
+    "medium",
+    "high"
+  ],
+  "confusion_matrix": [
+    [
+      3,
+      16,
+      39
+    ],
+    [
+      14,
+      6,
+      55
+    ],
+    [
+      7,
+      18,
+      42
+    ]
+  ],
+  "f1_low": 0.07317073170731707,
+  "precision_low": 0.125,
+  "recall_low": 0.05172413793103448,
+  "f1_medium": 0.10434782608695652,
+  "precision_medium": 0.15,
+  "recall_medium": 0.08,
+  "f1_high": 0.41379310344827586,
+  "precision_high": 0.3088235294117647,
+  "recall_high": 0.6268656716417911
+}

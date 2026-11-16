@@ -1,0 +1,46 @@
+{
+  "model": "doc2vec_fulltext",
+  "aggregation": "doc2vec_fulltext_A0_daily_mean.csv",
+  "fold": 2,
+  "train_samples": 300,
+  "test_samples": 200,
+  "n_features": 102,
+  "accuracy": 0.35,
+  "balanced_accuracy": 0.3310090237899918,
+  "macro_f1": 0.32685371966501625,
+  "macro_precision": 0.333994708994709,
+  "macro_recall": 0.3310090237899918,
+  "mcc": -0.0025188606296516016,
+  "training_seconds": 0.11380505561828613,
+  "class_labels": [
+    "low",
+    "medium",
+    "high"
+  ],
+  "confusion_matrix": [
+    [
+      10,
+      14,
+      29
+    ],
+    [
+      12,
+      21,
+      36
+    ],
+    [
+      20,
+      19,
+      39
+    ]
+  ],
+  "f1_low": 0.21052631578947367,
+  "precision_low": 0.23809523809523808,
+  "recall_low": 0.18867924528301888,
+  "f1_medium": 0.34146341463414637,
+  "precision_medium": 0.3888888888888889,
+  "recall_medium": 0.30434782608695654,
+  "f1_high": 0.42857142857142855,
+  "precision_high": 0.375,
+  "recall_high": 0.5
+}

@@ -16,7 +16,7 @@ OUTPUT_DIR = (
     ROOT_DIR
     / "data"
     / "processed"
-    / "headlineVsFulltext"
+    / "head_vs_full"
 )
 
 RESULTS_PATH = OUTPUT_DIR / "experiment_results.csv"

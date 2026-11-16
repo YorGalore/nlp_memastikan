@@ -2,7 +2,7 @@
 # evaluate_temporal_aggregation.py
 #
 # Evaluasi A0-A4 Temporal Aggregation
-# Target       : direction (down / flat / up)
+# Target       : volatility_class (low / medium / high)
 # Validation   : Chronological Walk-Forward CV
 # Classifier   : PyTorch Linear Classifier
 # Device       : Apple MPS -> CUDA -> CPU
@@ -50,7 +50,9 @@ ALIGNED_DAILY_CSV = ROOT / "data/processed/aligned_daily.csv"
 
 TEMPORAL_AGG_DIR = ROOT / "data/processed/temporal_aggregation"
 
-OUTPUT_DIR = ROOT / "data/processed/temporal_evaluation"
+# Separate output directory so cached direction-classification results
+# cannot be mistaken for volatility-classification results.
+OUTPUT_DIR = ROOT / "data/processed/temporal_evaluation_volatility_class"
 
 RESULTS_DIR = OUTPUT_DIR / "results"
 
@@ -62,12 +64,16 @@ RANKING_CSV = OUTPUT_DIR / "temporal_aggregation_ranking.csv"
 # Target
 # ------------------------------------------------------------
 
-TARGET_COLUMN = "direction"
+# volatility_class is created upstream in aligned_daily.csv according to
+# the project report. This evaluator deliberately does not recompute qcut
+# boundaries: they must be learned from the earliest 70% of calendar data
+# and then kept fixed for train/validation/test.
+TARGET_COLUMN = "volatility_class"
 
 TARGET_CLASSES = [
-    "down",
-    "flat",
-    "up",
+    "low",
+    "medium",
+    "high",
 ]
 
 CLASS_TO_IDX = {
@@ -216,6 +222,80 @@ def ensure_dirs():
 # LOAD CALENDAR
 # ============================================================
 
+def add_volatility_class_from_report(df, source_name="aligned_daily.csv"):
+    """
+    Create volatility_class only when it is absent, following the project report.
+
+    The qcut boundaries are estimated from realized_vol in the earliest 70%
+    of the complete chronological calendar (before any no-news filtering),
+    then fixed and applied to the full period.
+    """
+    if TARGET_COLUMN in df.columns:
+        return df, None
+
+    if "realized_vol" not in df.columns:
+        raise ValueError(
+            f"{source_name} belum memiliki kolom {TARGET_COLUMN!r} maupun "
+            "realized_vol. Target volatilitas tidak dapat dibentuk. "
+            "Pastikan aligned_daily.csv memuat realized_vol sesuai definisi laporan."
+        )
+
+    realized_vol = pd.to_numeric(df["realized_vol"], errors="coerce")
+    reference_size = int(len(df) * 0.70)
+    if reference_size < 3:
+        raise ValueError(
+            f"Data terlalu sedikit untuk membentuk tertile: {len(df)} observasi kalender."
+        )
+
+    reference = realized_vol.iloc[:reference_size].dropna()
+    if reference.nunique() < 3:
+        raise ValueError(
+            "Nilai realized_vol pada 70% observasi kalender paling awal "
+            "tidak memiliki minimal tiga nilai unik; pd.qcut tidak dapat "
+            "membentuk tiga kelas volatilitas."
+        )
+
+    try:
+        _, bin_edges = pd.qcut(
+            reference,
+            q=3,
+            labels=TARGET_CLASSES,
+            retbins=True,
+            duplicates="raise",
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "Gagal membentuk tertile volatility_class dari 70% observasi "
+            f"kalender paling awal: {exc}"
+        ) from exc
+
+    if len(bin_edges) != 4:
+        raise ValueError(
+            f"pd.qcut menghasilkan {len(bin_edges) - 1} interval, "
+            "padahal laporan menetapkan tiga kelas (low/medium/high)."
+        )
+
+    lower_threshold = float(bin_edges[1])
+    upper_threshold = float(bin_edges[2])
+    df = df.copy()
+    df["realized_vol"] = realized_vol
+    df[TARGET_COLUMN] = pd.cut(
+        realized_vol,
+        bins=[-np.inf, lower_threshold, upper_threshold, np.inf],
+        labels=TARGET_CLASSES,
+        include_lowest=True,
+    )
+
+    print(
+        "[INFO] volatility_class dibuat dari realized_vol menggunakan "
+        "pd.qcut pada 70% kalender paling awal: "
+        f"threshold_1={lower_threshold:.8f}, "
+        f"threshold_2={upper_threshold:.8f}",
+        flush=True,
+    )
+    return df, (lower_threshold, upper_threshold)
+
+
 def load_calendar():
 
     if not ALIGNED_DAILY_CSV.exists():
@@ -226,18 +306,8 @@ def load_calendar():
 
     df = pd.read_csv(ALIGNED_DAILY_CSV)
 
-    required = {
-        "date",
-        TARGET_COLUMN,
-    }
-
-    missing = required - set(df.columns)
-
-    if missing:
-
-        raise ValueError(
-            f"Kolom calendar hilang: {sorted(missing)}"
-        )
+    if "date" not in df.columns:
+        raise ValueError("Kolom wajib 'date' tidak ada di aligned_daily.csv")
 
     df["date"] = pd.to_datetime(
         df["date"],
@@ -251,6 +321,15 @@ def load_calendar():
         )
 
     df = df.sort_values("date").reset_index(drop=True)
+    # Generate the report-defined label if the upstream file only has realized_vol.
+    df, _ = add_volatility_class_from_report(df)
+
+    # Match label casing from the report (Low / Medium / High) while using
+    # normalized lowercase strings internally. Do not drop null labels here:
+    # the first observations may not have a complete 5-day volatility window.
+    df[TARGET_COLUMN] = (
+        df[TARGET_COLUMN].astype("string").str.lower().str.strip()
+    )
 
     invalid_labels = set(
         df[TARGET_COLUMN].dropna().unique()
@@ -259,8 +338,8 @@ def load_calendar():
     if invalid_labels:
 
         raise ValueError(
-            f"Label direction tidak dikenal: "
-            f"{sorted(invalid_labels)}"
+            f"Label {TARGET_COLUMN} tidak dikenal: "
+            f"{sorted(invalid_labels)}. Label yang diperbolehkan: {TARGET_CLASSES}"
         )
 
     return df
@@ -325,6 +404,7 @@ def find_feature_columns(df):
         "date",
         TARGET_COLUMN,
         "direction",
+        "realized_vol",
         "news_count",
         "attention_news_count",
     }
@@ -825,138 +905,35 @@ def calculate_metrics(
     cm = confusion_matrix(
         y_true,
         y_pred,
-        labels=[
-            0,
-            1,
-            2
-        ]
+        labels=list(range(len(TARGET_CLASSES)))
     )
 
     metrics = {
-
-        "accuracy":
-            accuracy_score(
-                y_true,
-                y_pred
-            ),
-
-        "balanced_accuracy":
-            balanced_accuracy_score(
-                y_true,
-                y_pred
-            ),
-
-        "macro_f1":
-            f1_score(
-                y_true,
-                y_pred,
-                average="macro",
-                zero_division=0,
-            ),
-
-        "macro_precision":
-            precision_score(
-                y_true,
-                y_pred,
-                average="macro",
-                zero_division=0,
-            ),
-
-        "macro_recall":
-            recall_score(
-                y_true,
-                y_pred,
-                average="macro",
-                zero_division=0,
-            ),
-
-        "mcc":
-            matthews_corrcoef(
-                y_true,
-                y_pred
-            ),
-
-        "f1_down":
-            f1_score(
-                y_true,
-                y_pred,
-                labels=[0],
-                average="macro",
-                zero_division=0,
-            ),
-
-        "f1_flat":
-            f1_score(
-                y_true,
-                y_pred,
-                labels=[1],
-                average="macro",
-                zero_division=0,
-            ),
-
-        "f1_up":
-            f1_score(
-                y_true,
-                y_pred,
-                labels=[2],
-                average="macro",
-                zero_division=0,
-            ),
-
-        "precision_down":
-            precision_score(
-                y_true,
-                y_pred,
-                labels=[0],
-                average="macro",
-                zero_division=0,
-            ),
-
-        "precision_flat":
-            precision_score(
-                y_true,
-                y_pred,
-                labels=[1],
-                average="macro",
-                zero_division=0,
-            ),
-
-        "precision_up":
-            precision_score(
-                y_true,
-                y_pred,
-                labels=[2],
-                average="macro",
-                zero_division=0,
-            ),
-
-        "recall_down":
-            recall_score(
-                y_true,
-                y_pred,
-                labels=[0],
-                average="macro",
-                zero_division=0,
-            ),
-
-        "recall_flat":
-            recall_score(
-                y_true,
-                y_pred,
-                labels=[1],
-                average="macro",
-                zero_division=0,
-            ),
-
-        "recall_up":
-            recall_score(
-                y_true,
-                y_pred,
-                labels=[2],
-                average="macro",
-                zero_division=0,
-            ),
+        "accuracy": accuracy_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "macro_f1": f1_score(
+            y_true, y_pred, average="macro", zero_division=0
+        ),
+        "macro_precision": precision_score(
+            y_true, y_pred, average="macro", zero_division=0
+        ),
+        "macro_recall": recall_score(
+            y_true, y_pred, average="macro", zero_division=0
+        ),
+        "mcc": matthews_corrcoef(y_true, y_pred),
     }
+
+    # Per-class precision, recall, and F1 (Low / Medium / High).
+    for class_idx, class_name in enumerate(TARGET_CLASSES):
+        metrics[f"precision_{class_name}"] = precision_score(
+            y_true, y_pred, labels=[class_idx], average="macro", zero_division=0
+        )
+        metrics[f"recall_{class_name}"] = recall_score(
+            y_true, y_pred, labels=[class_idx], average="macro", zero_division=0
+        )
+        metrics[f"f1_{class_name}"] = f1_score(
+            y_true, y_pred, labels=[class_idx], average="macro", zero_division=0
+        )
 
     return metrics, cm
 
@@ -1310,36 +1287,20 @@ def evaluate_one_file(
             "mcc":
                 metrics["mcc"],
 
-            "f1_down":
-                metrics["f1_down"],
-
-            "f1_flat":
-                metrics["f1_flat"],
-
-            "f1_up":
-                metrics["f1_up"],
-
-            "precision_down":
-                metrics["precision_down"],
-
-            "precision_flat":
-                metrics["precision_flat"],
-
-            "precision_up":
-                metrics["precision_up"],
-
-            "recall_down":
-                metrics["recall_down"],
-
-            "recall_flat":
-                metrics["recall_flat"],
-
-            "recall_up":
-                metrics["recall_up"],
-
             "training_seconds":
                 training_seconds,
+
+            "class_labels":
+                TARGET_CLASSES,
+
+            "confusion_matrix":
+                cm.tolist(),
         }
+
+        for class_name in TARGET_CLASSES:
+            result[f"f1_{class_name}"] = metrics[f"f1_{class_name}"]
+            result[f"precision_{class_name}"] = metrics[f"precision_{class_name}"]
+            result[f"recall_{class_name}"] = metrics[f"recall_{class_name}"]
 
         all_results.append(
             result
@@ -1392,17 +1353,15 @@ def aggregate_results(
         "macro_precision",
         "macro_recall",
         "mcc",
-        "f1_down",
-        "f1_flat",
-        "f1_up",
-        "precision_down",
-        "precision_flat",
-        "precision_up",
-        "recall_down",
-        "recall_flat",
-        "recall_up",
         "training_seconds",
     ]
+
+    for class_name in TARGET_CLASSES:
+        numeric_metrics.extend([
+            f"f1_{class_name}",
+            f"precision_{class_name}",
+            f"recall_{class_name}",
+        ])
 
     result = {
 
@@ -1477,7 +1436,7 @@ def main():
     )
 
     log(
-        "Direction distribution:"
+        f"{TARGET_COLUMN} distribution:"
     )
 
     print(
@@ -1689,7 +1648,7 @@ def main():
         )
 
         summary_df = summary_df.sort_values(
-            "macro_f1_mean",
+            "accuracy_mean",
             ascending=False
         ).reset_index(
             drop=True
@@ -1719,17 +1678,17 @@ def main():
             "aggregation",
             "n_folds",
             "n_features",
+            "accuracy_mean",
+            "accuracy_std",
             "macro_f1_mean",
             "macro_f1_std",
             "balanced_accuracy_mean",
             "balanced_accuracy_std",
-            "accuracy_mean",
-            "accuracy_std",
             "mcc_mean",
             "mcc_std",
-            "f1_down_mean",
-            "f1_flat_mean",
-            "f1_up_mean",
+            "f1_low_mean",
+            "f1_medium_mean",
+            "f1_high_mean",
         ]
 
         ranking_columns = [
@@ -1761,7 +1720,7 @@ def main():
         print()
         print(
             "TOP 10 CONFIGURATIONS "
-            "BERDASARKAN MEAN MACRO F1"
+            "BERDASARKAN MEAN ACCURACY"
         )
 
         top10 = (
@@ -1769,7 +1728,7 @@ def main():
                 all_summary_results
             )
             .sort_values(
-                "macro_f1_mean",
+                "accuracy_mean",
                 ascending=False
             )
             .head(10)
@@ -1778,10 +1737,11 @@ def main():
         display_columns = [
             "model",
             "aggregation",
+            "accuracy_mean",
+            "accuracy_std",
             "macro_f1_mean",
             "macro_f1_std",
             "balanced_accuracy_mean",
-            "accuracy_mean",
             "mcc_mean",
         ]
 

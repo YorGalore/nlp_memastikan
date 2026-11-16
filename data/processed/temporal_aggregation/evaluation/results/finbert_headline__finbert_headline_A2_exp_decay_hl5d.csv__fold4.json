@@ -1,0 +1,46 @@
+{
+  "model": "finbert_headline",
+  "aggregation": "finbert_headline_A2_exp_decay_hl5d.csv",
+  "fold": 4,
+  "train_samples": 700,
+  "test_samples": 200,
+  "n_features": 768,
+  "accuracy": 0.345,
+  "balanced_accuracy": 0.3862765957446808,
+  "macro_f1": 0.28189705553788463,
+  "macro_precision": 0.35525030525030526,
+  "macro_recall": 0.3862765957446808,
+  "mcc": 0.08761773294729884,
+  "training_seconds": 0.11570620536804199,
+  "class_labels": [
+    "low",
+    "medium",
+    "high"
+  ],
+  "confusion_matrix": [
+    [
+      18,
+      5,
+      2
+    ],
+    [
+      31,
+      3,
+      13
+    ],
+    [
+      68,
+      12,
+      48
+    ]
+  ],
+  "f1_low": 0.2535211267605634,
+  "precision_low": 0.15384615384615385,
+  "recall_low": 0.72,
+  "f1_medium": 0.08955223880597014,
+  "precision_medium": 0.15,
+  "recall_medium": 0.06382978723404255,
+  "f1_high": 0.5026178010471204,
+  "precision_high": 0.7619047619047619,
+  "recall_high": 0.375
+}

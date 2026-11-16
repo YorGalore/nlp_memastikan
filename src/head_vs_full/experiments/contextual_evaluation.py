@@ -1,44 +1,3 @@
-#!/usr/bin/env python3
-"""
-Evaluate contextual text embeddings for USD/IDR direction prediction.
-
-Model groups
-------------
-- FinBERT : domain-specific (financial-domain language model)
-- RoBERTa : general-purpose
-- Qwen    : general-purpose
-
-The script discovers daily feature files under data/processed/ whose filenames
-contain one model name (finbert/roberta/qwen) and one text type (headline/fulltext).
-Typical accepted filenames:
-    finbert_headline_features.csv
-    headline_roberta_features.csv
-    qwen_fulltext_features.csv
-    contextual_finbert_fulltext_features.csv
-
-Expected target file:
-    data/processed/aligned_daily.csv
-with at least: date, direction, log_return
-
-Evaluation:
-1. Embedding-only linear probe (multiclass Logistic Regression)
-2. Lagged-market baseline (if lag columns are available)
-3. Lagged-market + embedding
-4. Regression probe for log_return (Ridge)
-
-Temporal evaluation uses TimeSeriesSplit. The `flat` class is retained.
-Missing feature dates / empty documents are filled with zero vectors, so all
-eligible target dates remain in the evaluation. This assumes the embedding
-pipeline represents empty documents as zero or omits their rows; verify this
-assumption against the feature-generation script before final reporting.
-
-Run from repository root:
-    python -u src/evaluation/evaluate_contextual_embeddings.py
-
-Or place this script elsewhere and run it from repository root:
-    python -u /mnt/data/evaluate_contextual_embeddings.py
-"""
-
 from __future__ import annotations
 
 import ast
@@ -77,7 +36,8 @@ from sklearn.preprocessing import StandardScaler
 ROOT_DIR = Path(__file__).resolve().parents[2] if Path(__file__).resolve().parent.name == "evaluation" else Path.cwd()
 DATA_DIR = ROOT_DIR / "data" / "processed"
 TARGET_FILE = DATA_DIR / "aligned_daily.csv"
-OUTPUT_DIR = DATA_DIR / "contextual_embedding_evaluation"
+FEATURE_DIR = DATA_DIR / "head_vs_full"
+OUTPUT_DIR = DATA_DIR / "contextual_embedding_volatility_evaluation"
 
 MODEL_GROUPS = {
     "finbert": "domain_specific",
@@ -101,12 +61,12 @@ MARKET_LAG_CANDIDATES = [
     "lag3_realized_vol",
 ]
 
-CLASS_ORDER = ["down", "flat", "up"]
+CLASS_ORDER = ["low", "medium", "high"]
 
 # Columns that should never be interpreted as embedding dimensions.
 METADATA_COLUMNS = {
     "date", "target_date", "published_date", "datetime", "timestamp",
-    "direction", "log_return", "return", "delta", "kurs", "prev_kurs",
+    "direction", "volatility_class", "log_return", "return", "delta", "kurs", "prev_kurs",
     "prev_date", "gap_days", "realized_vol", "lag1_log_return",
     "lag2_log_return", "lag3_log_return", "lag1_realized_vol",
     "lag2_realized_vol", "lag3_realized_vol", "n_news", "headline_count",
@@ -160,12 +120,20 @@ def identify_model_and_text_type(path: Path) -> tuple[str, str] | None:
 
 
 def discover_feature_files() -> dict[tuple[str, str], Path]:
-    found: dict[tuple[str, str], Path] = {}
-    ignored: list[Path] = []
+    """Discover only the intended headline/fulltext embedding feature CSVs.
 
-    for path in DATA_DIR.rglob("*.csv"):
-        if OUTPUT_DIR in path.parents:
-            continue
+    The evaluation must not accidentally load temporal-aggregation diagnostics
+    or other intermediate CSVs that happen to contain a model/text-type name.
+    """
+    found: dict[tuple[str, str], Path] = {}
+
+    if not FEATURE_DIR.exists():
+        raise FileNotFoundError(
+            f"Direktori fitur tidak ditemukan: {FEATURE_DIR}\n"
+            "Pastikan eksperimen headline vs fulltext sudah menghasilkan file fitur."
+        )
+
+    for path in FEATURE_DIR.rglob("*_features.csv"):
         identified = identify_model_and_text_type(path)
         if identified is None:
             continue
@@ -173,10 +141,10 @@ def discover_feature_files() -> dict[tuple[str, str], Path]:
         key = identified
         if key in found:
             raise RuntimeError(
-                f"Ditemukan lebih dari satu file untuk {key}:\n"
+                f"Ditemukan lebih dari satu file fitur untuk {key}:\n"
                 f"- {found[key]}\n- {path}\n"
-                "Sisakan satu file per kombinasi model dan jenis teks, atau "
-                "ubah fungsi discover_feature_files() agar menunjuk file yang benar."
+                f"Periksa isi direktori {FEATURE_DIR} dan sisakan satu file "
+                "*_features.csv untuk setiap kombinasi model dan jenis teks."
             )
         found[key] = path
 
@@ -310,28 +278,80 @@ def load_feature_file(path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
 
 
 def load_targets() -> pd.DataFrame:
+    """Load the project-defined volatility target.
+
+    realized_vol(t) is the standard deviation of the latest five BI business-day
+    log returns, including day t. Volatility class cutoffs are estimated from
+    the earliest 70% of chronological observations and then held fixed.
+    """
     if not TARGET_FILE.exists():
         raise FileNotFoundError(
-            f"Target file tidak ditemukan: {TARGET_FILE}\n"
+            f"Target file tidak ditemukan: {TARGET_FILE}\\n"
             "Pastikan script dijalankan dari root repository dan aligned_daily.csv tersedia."
         )
 
     target = pd.read_csv(TARGET_FILE)
-    required = {"date", "direction", "log_return"}
+    required = {"date", "log_return"}
     missing = required - set(target.columns)
     if missing:
         raise ValueError(f"Kolom wajib tidak ada di aligned_daily.csv: {sorted(missing)}")
 
     target["date"] = pd.to_datetime(target["date"], errors="coerce").dt.normalize()
-    target["direction"] = target["direction"].astype(str).str.strip().str.lower()
     target["log_return"] = pd.to_numeric(target["log_return"], errors="coerce")
-    target = target.dropna(subset=["date", "direction", "log_return"])
-    target = target[target["direction"].isin(CLASS_ORDER)].copy()
-    target = target.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+    target = target.dropna(subset=["date"]).sort_values("date")
+    target = target.drop_duplicates("date", keep="last").reset_index(drop=True)
+
+    # Prefer the report-aligned realized_vol column; derive it only if absent.
+    if "realized_vol" in target.columns:
+        target["realized_vol"] = pd.to_numeric(target["realized_vol"], errors="coerce")
+    else:
+        target["realized_vol"] = target["log_return"].rolling(
+            window=5, min_periods=5
+        ).std()
+
+    # Use an existing class column only when it contains the expected labels.
+    valid_classes = set(CLASS_ORDER)
+    if "volatility_class" in target.columns:
+        target["volatility_class"] = (
+            target["volatility_class"].astype(str).str.strip().str.lower()
+        )
+        observed_classes = set(target["volatility_class"].dropna().unique())
+        if not observed_classes.issubset(valid_classes):
+            target["volatility_class"] = np.nan
+    else:
+        target["volatility_class"] = np.nan
+
+    # If class labels are absent/invalid, reproduce the project's fixed
+    # tertile thresholds using only the earliest 70% of chronological rows.
+    if target["volatility_class"].isna().any():
+        valid_vol = target["realized_vol"].notna()
+        chronological_valid = target.loc[valid_vol, "realized_vol"]
+        if len(chronological_valid) < 3:
+            raise ValueError("Tidak cukup observasi realized_vol untuk membentuk tiga kelas volatilitas.")
+
+        calibration_n = max(3, int(np.floor(len(chronological_valid) * 0.70)))
+        calibration = chronological_valid.iloc[:calibration_n]
+        q_low, q_high = calibration.quantile([1 / 3, 2 / 3]).to_numpy()
+        if not np.isfinite(q_low) or not np.isfinite(q_high) or q_low >= q_high:
+            raise ValueError(
+                "Threshold tertile realized_vol tidak valid. Periksa distribusi realized_vol."
+            )
+        target["volatility_class"] = pd.cut(
+            target["realized_vol"],
+            bins=[-np.inf, q_low, q_high, np.inf],
+            labels=CLASS_ORDER,
+            include_lowest=True,
+        ).astype("object")
+
+    target = target.dropna(subset=["realized_vol", "volatility_class"])
+    target = target[target["volatility_class"].isin(CLASS_ORDER)].copy()
+    target["volatility_class"] = pd.Categorical(
+        target["volatility_class"], categories=CLASS_ORDER, ordered=True
+    ).astype(str)
 
     if target.empty:
-        raise ValueError("Tidak ada baris target valid setelah membersihkan aligned_daily.csv.")
-    return target
+        raise ValueError("Tidak ada baris target volatilitas valid setelah preprocessing.")
+    return target.reset_index(drop=True)
 
 
 def make_classifier() -> Pipeline:
@@ -359,7 +379,7 @@ def make_regressor() -> Pipeline:
 def explore_embedding_space(
     X: np.ndarray,
     dates: pd.Series,
-    directions: np.ndarray,
+    volatility_classes: np.ndarray,
     *,
     model: str,
     model_group: str,
@@ -389,7 +409,7 @@ def explore_embedding_space(
 
     projection = pd.DataFrame({
         "date": pd.to_datetime(dates).dt.strftime("%Y-%m-%d"),
-        "direction": directions,
+        "volatility_class": volatility_classes,
         "model": model,
         "model_group": model_group,
         "text_type": text_type,
@@ -426,16 +446,16 @@ def classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, 
         "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
         "macro_f1": float(f1_score(y_true, y_pred, labels=CLASS_ORDER, average="macro", zero_division=0)),
         "weighted_f1": float(f1_score(y_true, y_pred, labels=CLASS_ORDER, average="weighted", zero_division=0)),
-        "f1_down": float(f1_score(y_true, y_pred, labels=CLASS_ORDER, average=None, zero_division=0)[0]),
-        "f1_flat": float(f1_score(y_true, y_pred, labels=CLASS_ORDER, average=None, zero_division=0)[1]),
-        "f1_up": float(f1_score(y_true, y_pred, labels=CLASS_ORDER, average=None, zero_division=0)[2]),
+        "f1_low": float(f1_score(y_true, y_pred, labels=CLASS_ORDER, average=None, zero_division=0)[0]),
+        "f1_medium": float(f1_score(y_true, y_pred, labels=CLASS_ORDER, average=None, zero_division=0)[1]),
+        "f1_high": float(f1_score(y_true, y_pred, labels=CLASS_ORDER, average=None, zero_division=0)[2]),
     }
 
 
 def evaluate_feature_set(
     X: np.ndarray,
     y: np.ndarray,
-    returns: np.ndarray,
+    realized_vol: np.ndarray,
     dates: pd.Series,
     *,
     model_name: str,
@@ -466,7 +486,7 @@ def evaluate_feature_set(
                 "text_type": text_type,
                 "scenario": scenario,
                 "fold": fold,
-                "task": "classification_direction",
+                "task": "classification_volatility",
                 "train_start": str(dates.iloc[train_idx].min().date()),
                 "train_end": str(dates.iloc[train_idx].max().date()),
                 "test_start": str(dates.iloc[test_idx].min().date()),
@@ -511,26 +531,26 @@ def evaluate_feature_set(
                         "count": int(cm[i, j]),
                     })
 
-        # Regression on the continuous log return is evaluated independently.
+        # Regression on continuous realized volatility is evaluated independently.
         reg = make_regressor()
-        reg.fit(X[train_idx], returns[train_idx])
-        return_pred = reg.predict(X[test_idx])
+        reg.fit(X[train_idx], realized_vol[train_idx])
+        volatility_pred = reg.predict(X[test_idx])
         fold_rows.append({
             "model": model_name,
             "model_group": model_group,
             "text_type": text_type,
             "scenario": scenario,
             "fold": fold,
-            "task": "regression_log_return",
+            "task": "regression_realized_volatility",
             "train_start": str(dates.iloc[train_idx].min().date()),
             "train_end": str(dates.iloc[train_idx].max().date()),
             "test_start": str(dates.iloc[test_idx].min().date()),
             "test_end": str(dates.iloc[test_idx].max().date()),
             "n_train": int(len(train_idx)),
             "n_test": int(len(test_idx)),
-            "mae": float(mean_absolute_error(returns[test_idx], return_pred)),
-            "rmse": float(np.sqrt(mean_squared_error(returns[test_idx], return_pred))),
-            "r2": float(r2_score(returns[test_idx], return_pred)) if len(test_idx) > 1 else np.nan,
+            "mae": float(mean_absolute_error(realized_vol[test_idx], volatility_pred)),
+            "rmse": float(np.sqrt(mean_squared_error(realized_vol[test_idx], volatility_pred))),
+            "r2": float(r2_score(realized_vol[test_idx], volatility_pred)) if len(test_idx) > 1 else np.nan,
         })
 
     return fold_rows, class_rows, confusion_rows
@@ -542,7 +562,7 @@ def summarize_results(fold_df: pd.DataFrame) -> pd.DataFrame:
 
     metric_columns = [
         "accuracy", "balanced_accuracy", "macro_f1", "weighted_f1",
-        "f1_down", "f1_flat", "f1_up", "mae", "rmse", "r2",
+        "f1_low", "f1_medium", "f1_high", "mae", "rmse", "r2",
     ]
     rows: list[dict[str, Any]] = []
     keys = ["model", "model_group", "text_type", "scenario", "task"]
@@ -561,7 +581,7 @@ def summarize_results(fold_df: pd.DataFrame) -> pd.DataFrame:
 
 def build_domain_general_comparison(summary_df: pd.DataFrame) -> pd.DataFrame:
     subset = summary_df[
-        (summary_df["task"] == "classification_direction")
+        (summary_df["task"] == "classification_volatility")
         & (summary_df["scenario"].isin(["embedding_only", "market_plus_embedding"]))
     ].copy()
     if subset.empty:
@@ -603,12 +623,13 @@ def main() -> None:
     log("=" * 72)
     log(f"Repository root : {ROOT_DIR}")
     log(f"Data directory  : {DATA_DIR}")
+    log(f"Feature directory: {FEATURE_DIR}")
     log(f"Target file     : {TARGET_FILE}")
     log(f"Output directory: {OUTPUT_DIR}")
 
     targets = load_targets()
     log(f"Target rows     : {len(targets):,}")
-    log("Target classes  : " + str(targets["direction"].value_counts().to_dict()))
+    log("Target classes  : " + str(targets["volatility_class"].value_counts().to_dict()))
 
     feature_files = discover_feature_files()
     if not feature_files:
@@ -639,12 +660,12 @@ def main() -> None:
 
     # Evaluate a lagged-market-only benchmark once, to see whether text adds value.
     if market_matrix is not None and market_matrix.shape[1] > 0:
-        y_all = targets["direction"].to_numpy()
-        return_all = targets["log_return"].to_numpy(dtype=np.float64)
+        y_all = targets["volatility_class"].astype(str).to_numpy()
+        realized_vol_all = targets["realized_vol"].to_numpy(dtype=np.float64)
         dates_all = targets["date"].reset_index(drop=True)
         n_splits = min(N_SPLITS, max(2, len(targets) - 1))
         rows, class_rows, cm_rows = evaluate_feature_set(
-            market_matrix, y_all, return_all, dates_all,
+            market_matrix, y_all, realized_vol_all, dates_all,
             model_name="market_baseline",
             model_group="baseline",
             text_type="all",
@@ -659,7 +680,7 @@ def main() -> None:
         log(f"\nLoading {model} / {text_type}: {path.name}")
         feature_df, metadata = load_feature_file(path)
 
-        merged = targets[["date", "direction", "log_return"]].merge(
+        merged = targets[["date", "volatility_class", "realized_vol"]].merge(
             feature_df,
             on="date",
             how="left",
@@ -680,8 +701,8 @@ def main() -> None:
         coverage_rows.append(metadata)
         log(f"  Dimensions: {X_embedding.shape[1]} | dates without vector: {missing_feature_rows}")
 
-        y = merged["direction"].to_numpy()
-        returns = merged["log_return"].to_numpy(dtype=np.float64)
+        y = merged["volatility_class"].astype(str).to_numpy()
+        realized_vol = merged["realized_vol"].to_numpy(dtype=np.float64)
         dates = merged["date"].reset_index(drop=True)
 
         diagnostic, pca_projection = explore_embedding_space(
@@ -702,7 +723,7 @@ def main() -> None:
         for scenario, X in scenarios:
             log(f"  Evaluating: {scenario}")
             rows, class_rows, cm_rows = evaluate_feature_set(
-                X, y, returns, dates,
+                X, y, realized_vol, dates,
                 model_name=model,
                 model_group=MODEL_GROUPS[model],
                 text_type=text_type,
@@ -744,21 +765,22 @@ def main() -> None:
         "target_file": str(TARGET_FILE),
         "output_dir": str(OUTPUT_DIR),
         "n_target_rows": int(len(targets)),
-        "target_class_distribution": {k: int(v) for k, v in targets["direction"].value_counts().items()},
+        "target_class_distribution": {k: int(v) for k, v in targets["volatility_class"].value_counts().items()},
         "n_splits": N_SPLITS,
         "split_strategy": "TimeSeriesSplit (chronological; no random shuffle)",
         "classification_model": "StandardScaler + LogisticRegression(class_weight='balanced', L2)",
-        "regression_model": "StandardScaler + Ridge",
+        "regression_model": "StandardScaler + Ridge on realized_vol",
         "logistic_C": LOGISTIC_C,
         "ridge_alpha": RIDGE_ALPHA,
         "model_groups": MODEL_GROUPS,
         "market_lag_columns": available_market_cols,
         "feature_files": {f"{m}_{t}": str(p) for (m, t), p in feature_files.items()},
+        "target_definition": "realized_vol(t) = rolling standard deviation of the latest five BI business-day log returns, including t; volatility_class uses tertile thresholds fitted on earliest 70% of chronological observations.",
         "note": (
             "FinBERT is grouped as domain-specific; RoBERTa and Qwen as general-purpose. "
             "Group comparison is descriptive and does not isolate domain specialization "
             "from architecture, model size, pretraining corpus, or embedding extraction choices. "
-            "The flat class is retained."
+            "The low/medium/high volatility classes are retained."
         ),
     }
     with (OUTPUT_DIR / "evaluation_metadata.json").open("w", encoding="utf-8") as f:

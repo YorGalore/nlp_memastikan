@@ -1,0 +1,47 @@
+{
+  "target_file": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/aligned_daily.csv",
+  "target": "volatility_class (low/medium/high)",
+  "target_definition": "5-BI-business-day rolling standard deviation of log_return; tertile thresholds fitted on earliest 70% chronological observations, consistent with project target.",
+  "topic_model": "lda",
+  "topic_file": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/topic_modelling/lda/daily_topic_features.csv",
+  "ner_file": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/ner/daily_entity_features.csv",
+  "embedding_dir": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/head_vs_full",
+  "experiments": {
+    "E1_embedding_only": [
+      "embedding"
+    ],
+    "E2_embedding_plus_topic": [
+      "embedding",
+      "topic"
+    ],
+    "E3_embedding_plus_ner": [
+      "embedding",
+      "ner"
+    ],
+    "E4_embedding_plus_topic_ner": [
+      "embedding",
+      "topic",
+      "ner"
+    ]
+  },
+  "models": [
+    "finbert",
+    "roberta",
+    "qwen"
+  ],
+  "text_types": [
+    "headline",
+    "fulltext"
+  ],
+  "n_splits": 5,
+  "split_strategy": "TimeSeriesSplit (chronological, no shuffle)",
+  "classifier": "SimpleImputer(0) + StandardScaler + LogisticRegression(class_weight=balanced, L2)",
+  "n_target_rows": 1197,
+  "class_distribution": {
+    "low": 410,
+    "high": 402,
+    "medium": 385
+  },
+  "skipped_embedding_files": [],
+  "caveat": "Topic models were generated before this supervised evaluation. If topic models were fitted on the full time span, topic feature extraction is transductive; for strict forecasting claims, refit topic models inside each chronological training fold."
+}
