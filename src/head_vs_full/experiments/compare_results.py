@@ -46,6 +46,21 @@ results = pd.read_csv(RESULTS_PATH)
 if results.empty:
     raise ValueError("File experiment_results.csv kosong.")
 
+# Do not mix the single JISDOR-only baseline into the headline/fulltext pivot.
+# Every remaining row has the same JISDOR history plus one text representation.
+if "feature_set" in results.columns:
+    price_baseline = results[results["feature_set"] == "jisdor_price_only"].copy()
+    results = results[results["feature_set"] == "jisdor_plus_embedding"].copy()
+else:
+    price_baseline = pd.DataFrame()
+
+# Select representations by validation externally; this report presents the
+# held-out 15% test rows only, so validation and test are never mixed.
+if "evaluation_split" in results.columns:
+    results = results[results["evaluation_split"] == "test"].copy()
+    if not price_baseline.empty:
+        price_baseline = price_baseline[price_baseline["evaluation_split"] == "test"].copy()
+
 print("=" * 70)
 print("HEADLINE VS FULL TEXT COMPARISON")
 print("=" * 70)
@@ -56,7 +71,7 @@ print("=" * 70)
 # ============================================================
 
 results = results.sort_values(
-    by=["model", "text_type"]
+    by=["classifier", "model", "text_type"] if "classifier" in results.columns else ["model", "text_type"]
 ).reset_index(drop=True)
 
 
@@ -65,7 +80,7 @@ results = results.sort_values(
 # ============================================================
 
 comparison = results.pivot(
-    index="model",
+    index=["classifier", "model"] if "classifier" in results.columns else "model",
     columns="text_type",
     values=METRICS,
 )
@@ -144,7 +159,7 @@ comparison.to_csv(
 
 summary = (
     results
-    .groupby("text_type")[METRICS]
+    .groupby(["classifier", "text_type"] if "classifier" in results.columns else "text_type")[METRICS]
     .mean()
     .reset_index()
 )
@@ -165,6 +180,7 @@ print("\n1. INDIVIDUAL MODEL COMPARISON")
 print("-" * 70)
 
 display_columns = [
+    "classifier",
     "model",
     "roc_auc_headline",
     "roc_auc_fulltext",
@@ -202,6 +218,15 @@ print("-" * 70)
 print(
     comparison["roc_auc_winner"].value_counts().to_string()
 )
+
+if not price_baseline.empty:
+    print("\n4. JISDOR PRICE-ONLY BASELINE")
+    print("-" * 70)
+    print(
+        price_baseline[
+            [c for c in ["classifier", "accuracy", "precision_macro", "recall_macro", "f1_macro", "roc_auc", "pr_auc"] if c in price_baseline.columns]
+        ].to_string(index=False, float_format=lambda x: f"{x:.4f}")
+    )
 
 
 print("\n" + "=" * 70)

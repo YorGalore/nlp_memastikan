@@ -9,7 +9,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, label_binarize
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, confusion_matrix
+from xgboost import XGBClassifier
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -35,7 +35,8 @@ ALIGNED_PATH = DATA_DIR / "aligned_daily.csv"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-TEST_SIZE = 0.20
+TRAIN_FRAC = 0.70
+VALID_FRAC = 0.15
 RANDOM_STATE = 42
 
 # Three-class volatility classification
@@ -49,6 +50,16 @@ CLASS_MAPPING = {
 
 CLASS_NAMES = ["low", "medium", "high"]
 CLASS_LABELS = [0, 1, 2]
+
+# Seluruh fitur ini dibentuk dari JISDOR sebelum hari t.  Harga/return hari t
+# tidak boleh menjadi input karena dipakai membentuk target volatilitas hari t.
+JISDOR_FEATURES = [
+    "jisdor_lag1_log_return", "jisdor_lag2_log_return",
+    "jisdor_lag3_log_return", "jisdor_lag4_log_return",
+    "jisdor_known4_mean", "jisdor_known4_std",
+    "jisdor_vol_if_r0", "jisdor_vol_if_rtyp_pos",
+    "jisdor_vol_if_rtyp_neg", "jisdor_lag1_volatility_class",
+]
 
 EXPERIMENTS = {
     "word2vec_headline": "head_vs_full/headline/word2vec_headline_features.csv",
@@ -177,6 +188,35 @@ def ensure_volatility_target(aligned):
 
     aligned[TARGET_COLUMN] = normalize_target(aligned[TARGET_COLUMN])
     return aligned
+
+
+def add_jisdor_features(aligned):
+    """Add leakage-safe JISDOR history features used by every experiment.
+
+    The target at t uses return(t); consequently this function uses only
+    return(t-1) through return(t-4), plus the previous volatility class.
+    """
+    if "log_return" not in aligned.columns:
+        raise ValueError("aligned_daily.csv harus memuat log_return untuk membentuk fitur JISDOR.")
+
+    result = aligned.sort_values("date").reset_index(drop=True).copy()
+    returns = pd.to_numeric(result["log_return"], errors="coerce")
+    known = pd.concat([returns.shift(i) for i in (1, 2, 3, 4)], axis=1)
+
+    for lag in (1, 2, 3, 4):
+        result[f"jisdor_lag{lag}_log_return"] = returns.shift(lag)
+    result["jisdor_known4_mean"] = known.mean(axis=1, skipna=False)
+    result["jisdor_known4_std"] = known.std(axis=1, skipna=False)
+
+    def volatility_if(current_return):
+        return np.std(np.column_stack([known.to_numpy(), current_return]), axis=1, ddof=1)
+
+    typical_abs_return = returns.abs().expanding().median().shift(1).to_numpy()
+    result["jisdor_vol_if_r0"] = volatility_if(np.zeros(len(result)))
+    result["jisdor_vol_if_rtyp_pos"] = volatility_if(typical_abs_return)
+    result["jisdor_vol_if_rtyp_neg"] = volatility_if(-typical_abs_return)
+    result["jisdor_lag1_volatility_class"] = result[TARGET_COLUMN].shift(1)
+    return result
 
 
 # ============================================================
@@ -310,6 +350,7 @@ aligned = ensure_volatility_target(aligned)
 aligned = aligned.dropna(subset=[TARGET_COLUMN]).copy()
 aligned[TARGET_COLUMN] = aligned[TARGET_COLUMN].astype(int)
 aligned = aligned.sort_values("date").reset_index(drop=True)
+aligned = add_jisdor_features(aligned)
 
 if aligned["date"].duplicated().any():
     raise ValueError(
@@ -317,6 +358,7 @@ if aligned["date"].duplicated().any():
     )
 
 print(f"Total observations: {len(aligned)}")
+print(f"JISDOR price features: {len(JISDOR_FEATURES)} (all lagged; no day-t price leakage)")
 
 print("\nVolatility class distribution:")
 print(
@@ -331,27 +373,27 @@ print(
 
 
 # ============================================================
-# 6. CHRONOLOGICAL TRAIN-TEST SPLIT
+# 6. CHRONOLOGICAL 70/15/15 SPLIT
 # ============================================================
 
-split_index = int(
-    len(aligned) * (1 - TEST_SIZE)
-)
-
-train_dates = aligned.iloc[
-    :split_index
-]["date"]
-
-test_dates = aligned.iloc[
-    split_index:
-]["date"]
+train_end = int(len(aligned) * TRAIN_FRAC)
+valid_end = train_end + int(len(aligned) * VALID_FRAC)
+train_dates = aligned.iloc[:train_end]["date"]
+valid_dates = aligned.iloc[train_end:valid_end]["date"]
+test_dates = aligned.iloc[valid_end:]["date"]
 
 print("\n" + "=" * 65)
-print("CHRONOLOGICAL TRAIN-TEST SPLIT")
+print("CHRONOLOGICAL 70/15/15 SPLIT")
 print("=" * 65)
 
 print(f"Train observations: {len(train_dates)}")
+print(f"Valid observations: {len(valid_dates)}")
 print(f"Test observations : {len(test_dates)}")
+
+print(
+    f"Valid period : {valid_dates.min().date()} "
+    f"to {valid_dates.max().date()}"
+)
 
 print(
     f"Train period: {train_dates.min().date()} "
@@ -370,6 +412,77 @@ print(
 
 all_results = []
 all_predictions = []
+
+
+def fit_and_score(train_data, valid_data, test_data, feature_columns, *, experiment, model_name, text_type, feature_set, zero_embedding_dates=0):
+    """Train Logistic Regression and XGBoost on the identical feature matrix."""
+    X_train = train_data[feature_columns]
+    y_train = train_data[TARGET_COLUMN]
+    if set(CLASS_LABELS) - set(y_train.unique()):
+        print("[SKIPPED] Training tidak memiliki seluruh tiga kelas target.")
+        return
+
+    classifiers = {
+        "logistic_regression": Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler", StandardScaler()),
+            ("classifier", LogisticRegression(max_iter=5000, class_weight="balanced", random_state=RANDOM_STATE)),
+        ]),
+        "xgboost": Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("classifier", XGBClassifier(
+                objective="multi:softprob", num_class=len(CLASS_LABELS),
+                n_estimators=300, max_depth=3, learning_rate=0.05,
+                subsample=0.8, colsample_bytree=0.8, eval_metric="mlogloss",
+                random_state=RANDOM_STATE, n_jobs=-1,
+            )),
+        ]),
+    }
+    for classifier_name, model in classifiers.items():
+        model.fit(X_train, y_train)
+        for evaluation_split, evaluation_data in {"validation": valid_data, "test": test_data}.items():
+            X_eval = evaluation_data[feature_columns]
+            y_eval = evaluation_data[TARGET_COLUMN]
+            if set(CLASS_LABELS) - set(y_eval.unique()):
+                print(f"[SKIPPED] {evaluation_split} tidak memiliki seluruh tiga kelas target.")
+                continue
+            y_pred = model.predict(X_eval).astype(int)
+            y_prob = model.predict_proba(X_eval)
+            metrics = calculate_metrics(y_eval, y_pred, y_prob)
+            all_results.append({
+            "experiment": experiment, "model": model_name, "classifier": classifier_name,
+            "text_type": text_type, "feature_set": feature_set, "evaluation_split": evaluation_split,
+            "n_features": len(feature_columns), "n_jisdor_features": len(JISDOR_FEATURES),
+            "n_embedding_features": len(feature_columns) - len(JISDOR_FEATURES),
+            "train_samples": len(X_train), "validation_samples": len(valid_data), "test_samples": len(test_data),
+            "low_evaluation": int((y_eval == 0).sum()), "medium_evaluation": int((y_eval == 1).sum()),
+            "high_evaluation": int((y_eval == 2).sum()), "zero_embedding_dates": int(zero_embedding_dates),
+            **metrics,
+            })
+            all_predictions.append(pd.DataFrame({
+                "date": evaluation_data["date"].values, "experiment": experiment,
+                "classifier": classifier_name, "feature_set": feature_set, "evaluation_split": evaluation_split,
+                "y_true": y_eval.values, "y_pred": y_pred,
+                "prob_low": y_prob[:, 0], "prob_medium": y_prob[:, 1], "prob_high": y_prob[:, 2],
+            }))
+            print(f"\nEvaluation results ({classifier_name}, {evaluation_split}):")
+            for metric, value in metrics.items():
+                print(f"{metric:18s}: {value:.4f}")
+
+
+# Market-only benchmark: required to determine whether a headline/fulltext
+# embedding adds information beyond the same JISDOR history.
+price_train = aligned[aligned["date"].isin(train_dates)].copy()
+price_valid = aligned[aligned["date"].isin(valid_dates)].copy()
+price_test = aligned[aligned["date"].isin(test_dates)].copy()
+print("\n" + "=" * 65)
+print("BASELINE: JISDOR PRICE HISTORY ONLY")
+print("=" * 65)
+fit_and_score(
+    price_train, price_valid, price_test, JISDOR_FEATURES,
+    experiment="jisdor_price_only", model_name="jisdor", text_type="price_only",
+    feature_set="jisdor_price_only",
+)
 
 for experiment_name, filename in EXPERIMENTS.items():
 
@@ -425,7 +538,7 @@ for experiment_name, filename in EXPERIMENTS.items():
     # --------------------------------------------------------
 
     dataset = aligned[
-        ["date", TARGET_COLUMN]
+        ["date", TARGET_COLUMN] + JISDOR_FEATURES
     ].merge(
         features[["date"] + feature_columns],
         on="date",
@@ -461,137 +574,31 @@ for experiment_name, filename in EXPERIMENTS.items():
     test_data = dataset[
         dataset["date"].isin(test_dates)
     ].copy()
+    valid_data = dataset[
+        dataset["date"].isin(valid_dates)
+    ].copy()
 
-    if len(train_data) == 0 or len(test_data) == 0:
-        print("[SKIPPED] Data train/test kosong.")
+    if len(train_data) == 0 or len(valid_data) == 0 or len(test_data) == 0:
+        print("[SKIPPED] Data train/valid/test kosong.")
         continue
 
-    X_train = train_data[feature_columns]
-    y_train = train_data[TARGET_COLUMN]
-
-    X_test = test_data[feature_columns]
-    y_test = test_data[TARGET_COLUMN]
-
-    if set(CLASS_LABELS) - set(y_train.unique()):
-        print(
-            "[SKIPPED] Training tidak memiliki seluruh "
-            "tiga kelas target."
-        )
-        continue
-
-    if set(CLASS_LABELS) - set(y_test.unique()):
-        print(
-            "[SKIPPED] Testing tidak memiliki seluruh "
-            "tiga kelas target; multiclass AUC tidak dapat "
-            "dibandingkan secara konsisten."
-        )
-        continue
-
-    print(f"Train samples: {len(X_train)}")
-    print(f"Test samples : {len(X_test)}")
+    model_feature_columns = JISDOR_FEATURES + feature_columns
+    print(f"Train samples: {len(train_data)}")
+    print(f"Valid samples: {len(valid_data)}")
+    print(f"Test samples : {len(test_data)}")
+    print(f"JISDOR features     : {len(JISDOR_FEATURES)}")
     print(
         f"Dates with all-zero embeddings: "
         f"{missing_embedding_dates}"
     )
-
-    # --------------------------------------------------------
-    # LOGISTIC REGRESSION
-    # --------------------------------------------------------
-
-    model = Pipeline([
-        (
-            "imputer",
-            SimpleImputer(
-                strategy="constant",
-                fill_value=0,
-            ),
-        ),
-        (
-            "scaler",
-            StandardScaler(),
-        ),
-        (
-            "classifier",
-            LogisticRegression(
-                max_iter=3000,
-                random_state=RANDOM_STATE,
-            ),
-        ),
-    ])
-
-    model.fit(
-        X_train,
-        y_train,
+    fit_and_score(
+        train_data, valid_data, test_data, model_feature_columns,
+        experiment=experiment_name,
+        model_name=experiment_name.rsplit("_", 1)[0],
+        text_type=experiment_name.rsplit("_", 1)[1],
+        feature_set="jisdor_plus_embedding",
+        zero_embedding_dates=missing_embedding_dates,
     )
-
-    # --------------------------------------------------------
-    # PREDICTION
-    # --------------------------------------------------------
-
-    y_pred = model.predict(X_test)
-
-    y_prob = model.predict_proba(X_test)
-
-    classifier = model.named_steps["classifier"]
-
-    # Ensure probability columns follow class order [0, 1, 2]
-    class_order = list(classifier.classes_)
-
-    y_prob = y_prob[
-        :,
-        [class_order.index(label) for label in CLASS_LABELS]
-    ]
-
-    # --------------------------------------------------------
-    # EVALUATION
-    # --------------------------------------------------------
-
-    metrics = calculate_metrics(
-        y_test,
-        y_pred,
-        y_prob,
-    )
-
-    result = {
-        "experiment": experiment_name,
-        "model": experiment_name.rsplit("_", 1)[0],
-        "text_type": experiment_name.rsplit("_", 1)[1],
-        "n_features": len(feature_columns),
-        "train_samples": len(X_train),
-        "test_samples": len(X_test),
-        "low_test": int((y_test == 0).sum()),
-        "medium_test": int((y_test == 1).sum()),
-        "high_test": int((y_test == 2).sum()),
-        "zero_embedding_dates": int(missing_embedding_dates),
-        **metrics,
-    }
-
-    all_results.append(result)
-
-    # --------------------------------------------------------
-    # SAVE TEST PREDICTIONS
-    # --------------------------------------------------------
-
-    predictions = pd.DataFrame({
-        "date": test_data["date"].values,
-        "experiment": experiment_name,
-        "y_true": y_test.values,
-        "y_pred": y_pred,
-        "prob_low": y_prob[:, 0],
-        "prob_medium": y_prob[:, 1],
-        "prob_high": y_prob[:, 2],
-    })
-
-    all_predictions.append(predictions)
-
-    # --------------------------------------------------------
-    # PRINT METRICS
-    # --------------------------------------------------------
-
-    print("\nEvaluation results:")
-
-    for metric, value in metrics.items():
-        print(f"{metric:18s}: {value:.4f}")
 
 
 # ============================================================
@@ -637,27 +644,6 @@ if all_predictions:
 # ============================================================
 # 9. FINAL SUMMARY
 # ============================================================
-print("\nCLASSIFICATION REPORT")
-print(
-    classification_report(
-        y_test,
-        y_pred,
-        labels=[0, 1, 2],
-        target_names=["Low", "Medium", "High"],
-        zero_division=0
-    )
-)
-
-print("\nCONFUSION MATRIX")
-print(
-    confusion_matrix(
-        y_test,
-        y_pred,
-        labels=[0, 1, 2]
-    )
-)
-
-
 print("\n" + "=" * 65)
 print("ALL EXPERIMENTS COMPLETED")
 print("=" * 65)
@@ -666,6 +652,10 @@ print(
     results_df[
         [
             "experiment",
+            "classifier",
+            "feature_set",
+            "n_jisdor_features",
+            "n_embedding_features",
             "roc_auc",
             "pr_auc",
             "accuracy",

@@ -21,9 +21,9 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from xgboost import XGBClassifier
 
 
 # ============================================================
@@ -33,19 +33,30 @@ from sklearn.preprocessing import StandardScaler
 MODELS = ("finbert", "roberta", "qwen")
 TEXT_TYPES = ("headline", "fulltext")
 CLASS_ORDER = ("low", "medium", "high")
-N_SPLITS = 5
+TRAIN_FRAC = 0.70
+VALID_FRAC = 0.15
 RANDOM_STATE = 42
 LOGISTIC_C = 1.0
+JISDOR_FEATURES = [
+    "jisdor_lag1_log_return", "jisdor_lag2_log_return", "jisdor_lag3_log_return", "jisdor_lag4_log_return",
+    "jisdor_known4_mean", "jisdor_known4_std", "jisdor_vol_if_r0", "jisdor_vol_if_rtyp_pos",
+    "jisdor_vol_if_rtyp_neg", "jisdor_lag1_volatility_class",
+]
 
 # LDA is the default because the project's topic evaluation showed full
 # document coverage. Change to bertopic/dtm/top2vec if that is the chosen model.
 TOPIC_MODEL = "lda"
 
 EXPERIMENTS = {
-    "E1_embedding_only": ("embedding",),
-    "E2_embedding_plus_topic": ("embedding", "topic"),
-    "E3_embedding_plus_ner": ("embedding", "ner"),
-    "E4_embedding_plus_topic_ner": ("embedding", "topic", "ner"),
+    "E0_jisdor_price_only": ("jisdor",),
+    "E1_jisdor_plus_embedding": ("jisdor", "embedding"),
+    "E2_jisdor_plus_embedding_topic": ("jisdor", "embedding", "topic"),
+    "E3_jisdor_plus_embedding_ner": ("jisdor", "embedding", "ner"),
+    "E4_jisdor_plus_embedding_topic_ner": ("jisdor", "embedding", "topic", "ner"),
+    "E5_jisdor_plus_embedding_temporal": ("jisdor", "embedding", "temporal"),
+    "E6_jisdor_plus_embedding_topic_temporal": ("jisdor", "embedding", "topic", "temporal"),
+    "E7_jisdor_plus_embedding_ner_temporal": ("jisdor", "embedding", "ner", "temporal"),
+    "E8_jisdor_plus_embedding_topic_ner_temporal": ("jisdor", "embedding", "topic", "ner", "temporal"),
 }
 
 logging.basicConfig(
@@ -73,6 +84,9 @@ TARGET_FILE = DATA_DIR / "aligned_daily.csv"
 EMBEDDING_DIR = DATA_DIR / "head_vs_full"
 TOPIC_FILE = DATA_DIR / "topic_modelling" / TOPIC_MODEL / "daily_topic_features.csv"
 NER_FILE = DATA_DIR / "ner" / "daily_entity_features.csv"
+# Chosen from the completed JISDOR-aware temporal smoke evaluation. Change this
+# explicit path after a full A0--A4 temporal sweep identifies a better variant.
+TEMPORAL_FILE = DATA_DIR / "temporal_aggregation" / "doc2vec_fulltext" / "doc2vec_fulltext_A0_daily_mean.csv"
 OUTPUT_DIR = DATA_DIR / "feature_fusion_evaluation"
 
 
@@ -157,7 +171,23 @@ def load_targets() -> pd.DataFrame:
     target = target.dropna(subset=["realized_vol", "volatility_class"])
     target = target[target["volatility_class"].isin(CLASS_ORDER)].copy()
     target["volatility_class"] = target["volatility_class"].astype(str)
-    return target[["date", "volatility_class", "realized_vol"]].reset_index(drop=True)
+    # Predictors from JISDOR are lagged so they contain no target-day market data.
+    returns = target["log_return"]
+    known = pd.concat([returns.shift(lag) for lag in (1, 2, 3, 4)], axis=1)
+    for lag in (1, 2, 3, 4):
+        target[f"jisdor_lag{lag}_log_return"] = returns.shift(lag)
+    target["jisdor_known4_mean"] = known.mean(axis=1, skipna=False)
+    target["jisdor_known4_std"] = known.std(axis=1, skipna=False)
+    def volatility_if(value: np.ndarray) -> np.ndarray:
+        return np.std(np.column_stack([known.to_numpy(), value]), axis=1, ddof=1)
+    typical = returns.abs().expanding().median().shift(1).to_numpy()
+    target["jisdor_vol_if_r0"] = volatility_if(np.zeros(len(target)))
+    target["jisdor_vol_if_rtyp_pos"] = volatility_if(typical)
+    target["jisdor_vol_if_rtyp_neg"] = volatility_if(-typical)
+    target["jisdor_lag1_volatility_class"] = target["volatility_class"].map(
+        {label: index for index, label in enumerate(CLASS_ORDER)}
+    ).shift(1)
+    return target[["date", "volatility_class", "realized_vol", *JISDOR_FEATURES]].reset_index(drop=True)
 
 
 def normalize_date(df: pd.DataFrame, path: Path) -> tuple[pd.DataFrame, str]:
@@ -273,18 +303,20 @@ def load_daily_numeric_features(path: Path, prefix: str, one_hot_dominant_topic:
     return features
 
 
-def make_classifier() -> Pipeline:
-    return Pipeline([
-        ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-        ("scaler", StandardScaler()),
-        ("classifier", LogisticRegression(
-            C=LOGISTIC_C,
-            max_iter=5000,
-            class_weight="balanced",
-            solver="lbfgs",
-            random_state=RANDOM_STATE,
-        )),
-    ])
+def make_classifiers() -> dict[str, Pipeline]:
+    return {
+        "logistic_regression": Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler", StandardScaler()),
+            ("classifier", LogisticRegression(C=LOGISTIC_C, max_iter=5000, class_weight="balanced", solver="lbfgs", random_state=RANDOM_STATE)),
+        ]),
+        "xgboost": Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("classifier", XGBClassifier(objective="multi:softprob", num_class=3, n_estimators=300, max_depth=3,
+                                         learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
+                                         eval_metric="mlogloss", random_state=RANDOM_STATE, n_jobs=-1)),
+        ]),
+    }
 
 
 def evaluate_one_configuration(
@@ -296,61 +328,51 @@ def evaluate_one_configuration(
     text_type: str,
     experiment: str,
     feature_coverage: dict[str, float],
-    n_splits: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     fold_rows: list[dict[str, Any]] = []
     class_rows: list[dict[str, Any]] = []
-    splitter = TimeSeriesSplit(n_splits=n_splits)
+    n_train = int(len(X) * TRAIN_FRAC)
+    n_valid = int(len(X) * VALID_FRAC)
+    train_idx = np.arange(n_train)
+    split_indices = {
+        "validation": np.arange(n_train, n_train + n_valid),
+        "test": np.arange(n_train + n_valid, len(X)),
+    }
+    y_train = y[train_idx]
+    if np.unique(y_train).size < 2:
+        raise ValueError(f"{model}/{text_type}/{experiment}: train tidak memiliki minimal dua kelas.")
 
-    for fold, (train_idx, test_idx) in enumerate(splitter.split(X), start=1):
-        y_train, y_test = y[train_idx], y[test_idx]
-        if np.unique(y_train).size < 2:
-            warnings.warn(f"Skip {model}/{text_type}/{experiment}/fold-{fold}: train hanya punya satu kelas.")
-            continue
-
-        clf = make_classifier()
-        clf.fit(X[train_idx], y_train)
-        pred = clf.predict(X[test_idx])
-        report = classification_report(
-            y_test, pred, labels=CLASS_ORDER, output_dict=True, zero_division=0
-        )
-        row = {
-            "model": model,
-            "text_type": text_type,
-            "experiment": experiment,
-            "fold": fold,
-            "n_train": int(len(train_idx)),
-            "n_test": int(len(test_idx)),
-            "train_start": str(dates.iloc[train_idx].min().date()),
-            "train_end": str(dates.iloc[train_idx].max().date()),
-            "test_start": str(dates.iloc[test_idx].min().date()),
-            "test_end": str(dates.iloc[test_idx].max().date()),
-            "n_features": int(X.shape[1]),
-            "accuracy": float(accuracy_score(y_test, pred)),
-            "balanced_accuracy": float(balanced_accuracy_score(y_test, pred)),
-            "macro_precision": float(precision_score(y_test, pred, labels=CLASS_ORDER, average="macro", zero_division=0)),
-            "macro_recall": float(recall_score(y_test, pred, labels=CLASS_ORDER, average="macro", zero_division=0)),
-            "macro_f1": float(f1_score(y_test, pred, labels=CLASS_ORDER, average="macro", zero_division=0)),
-            "weighted_f1": float(f1_score(y_test, pred, labels=CLASS_ORDER, average="weighted", zero_division=0)),
-            "f1_low": float(report["low"]["f1-score"]),
-            "f1_medium": float(report["medium"]["f1-score"]),
-            "f1_high": float(report["high"]["f1-score"]),
-            **feature_coverage,
-        }
-        fold_rows.append(row)
-
-        for label in CLASS_ORDER:
-            class_rows.append({
-                "model": model,
-                "text_type": text_type,
-                "experiment": experiment,
-                "fold": fold,
-                "class": label,
-                "precision": float(report[label]["precision"]),
-                "recall": float(report[label]["recall"]),
-                "f1_score": float(report[label]["f1-score"]),
-                "support": int(report[label]["support"]),
-            })
+    class_to_index = {label: index for index, label in enumerate(CLASS_ORDER)}
+    y_train_encoded = np.asarray([class_to_index[label] for label in y_train], dtype=int)
+    for classifier_name, clf_template in make_classifiers().items():
+        clf_template.fit(X[train_idx], y_train_encoded)
+        for evaluation_split, eval_idx in split_indices.items():
+            y_eval = y[eval_idx]
+            pred_encoded = clf_template.predict(X[eval_idx]).astype(int)
+            pred = np.asarray([CLASS_ORDER[index] for index in pred_encoded])
+            report = classification_report(y_eval, pred, labels=CLASS_ORDER, output_dict=True, zero_division=0)
+            row = {
+                "model": model, "text_type": text_type, "experiment": experiment, "classifier": classifier_name,
+                "evaluation_split": evaluation_split, "n_train": int(len(train_idx)), "n_validation": int(len(split_indices["validation"])), "n_test": int(len(split_indices["test"])),
+                "train_start": str(dates.iloc[train_idx].min().date()), "train_end": str(dates.iloc[train_idx].max().date()),
+                "evaluation_start": str(dates.iloc[eval_idx].min().date()), "evaluation_end": str(dates.iloc[eval_idx].max().date()),
+                "n_features": int(X.shape[1]), "accuracy": float(accuracy_score(y_eval, pred)),
+                "balanced_accuracy": float(balanced_accuracy_score(y_eval, pred)),
+                "macro_precision": float(precision_score(y_eval, pred, labels=CLASS_ORDER, average="macro", zero_division=0)),
+                "macro_recall": float(recall_score(y_eval, pred, labels=CLASS_ORDER, average="macro", zero_division=0)),
+                "macro_f1": float(f1_score(y_eval, pred, labels=CLASS_ORDER, average="macro", zero_division=0)),
+                "weighted_f1": float(f1_score(y_eval, pred, labels=CLASS_ORDER, average="weighted", zero_division=0)),
+                "f1_low": float(report["low"]["f1-score"]), "f1_medium": float(report["medium"]["f1-score"]),
+                "f1_high": float(report["high"]["f1-score"]), **feature_coverage,
+            }
+            fold_rows.append(row)
+            for label in CLASS_ORDER:
+                class_rows.append({
+                    "model": model, "text_type": text_type, "experiment": experiment, "classifier": classifier_name,
+                    "evaluation_split": evaluation_split, "class": label, "precision": float(report[label]["precision"]),
+                    "recall": float(report[label]["recall"]), "f1_score": float(report[label]["f1-score"]),
+                    "support": int(report[label]["support"]),
+                })
 
     return fold_rows, class_rows
 
@@ -362,27 +384,25 @@ def summarize(folds: pd.DataFrame) -> pd.DataFrame:
         "accuracy", "balanced_accuracy", "macro_precision", "macro_recall",
         "macro_f1", "weighted_f1", "f1_low", "f1_medium", "f1_high",
     ]
-    group_cols = ["model", "text_type", "experiment"]
+    group_cols = ["model", "text_type", "experiment", "classifier", "evaluation_split"]
     rows = []
     for keys, group in folds.groupby(group_cols, dropna=False):
         row = dict(zip(group_cols, keys))
-        row["n_folds"] = int(len(group))
+        row["n_evaluations"] = int(len(group))
         row["n_features"] = int(group["n_features"].iloc[0])
         for metric in metric_cols:
             row[f"{metric}_mean"] = float(group[metric].mean())
             row[f"{metric}_std"] = float(group[metric].std(ddof=1)) if len(group) > 1 else 0.0
-        for col in ["embedding_coverage_pct", "topic_coverage_pct", "ner_coverage_pct"]:
+        for col in ["embedding_coverage_pct", "topic_coverage_pct", "ner_coverage_pct", "temporal_coverage_pct"]:
             if col in group.columns:
                 row[col] = float(group[col].iloc[0])
         rows.append(row)
     result = pd.DataFrame(rows)
-    baseline = result[result["experiment"] == "E1_embedding_only"][
-        ["model", "text_type", "macro_f1_mean"]
-    ].rename(columns={"macro_f1_mean": "embedding_only_macro_f1_mean"})
-    result = result.merge(baseline, on=["model", "text_type"], how="left")
-    result["delta_macro_f1_vs_embedding_only"] = (
-        result["macro_f1_mean"] - result["embedding_only_macro_f1_mean"]
+    baseline = result[result["experiment"] == "E0_jisdor_price_only"][["classifier", "evaluation_split", "macro_f1_mean"]].rename(
+        columns={"macro_f1_mean": "jisdor_price_only_macro_f1_mean"}
     )
+    result = result.merge(baseline, on=["classifier", "evaluation_split"], how="left")
+    result["delta_macro_f1_vs_jisdor_price_only"] = result["macro_f1_mean"] - result["jisdor_price_only_macro_f1_mean"]
     return result.sort_values(["macro_f1_mean", "balanced_accuracy_mean"], ascending=False).reset_index(drop=True)
 
 
@@ -393,18 +413,29 @@ def main() -> None:
     logger.info("Output: %s", OUTPUT_DIR)
 
     targets = load_targets()
-    if len(targets) <= N_SPLITS:
-        raise ValueError(f"Jumlah target ({len(targets)}) tidak cukup untuk TimeSeriesSplit {N_SPLITS} folds.")
+    if len(targets) < 20:
+        raise ValueError(f"Jumlah target ({len(targets)}) tidak cukup untuk split 70/15/15.")
     logger.info("Target rows: %s | classes: %s", len(targets), targets["volatility_class"].value_counts().to_dict())
 
     # Topic and NER are loaded once and reused for each embedding configuration.
     topic_features = load_daily_numeric_features(TOPIC_FILE, "topic", one_hot_dominant_topic=True)
     ner_features = load_daily_numeric_features(NER_FILE, "ner", one_hot_dominant_topic=False)
+    temporal_features = load_daily_numeric_features(TEMPORAL_FILE, "temporal", one_hot_dominant_topic=False)
 
     all_fold_rows: list[dict[str, Any]] = []
     all_class_rows: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
-    n_splits = min(N_SPLITS, len(targets) - 1)
+
+    # Baseline required to establish whether text fusion adds anything beyond
+    # the market state available before the prediction day.
+    price_matrix = targets[JISDOR_FEATURES].to_numpy(dtype=np.float32)
+    baseline_rows, baseline_class_rows = evaluate_one_configuration(
+        price_matrix, targets["volatility_class"].to_numpy(), targets["date"].reset_index(drop=True),
+        model="jisdor", text_type="price_only", experiment="E0_jisdor_price_only",
+        feature_coverage={"embedding_coverage_pct": 0.0, "topic_coverage_pct": 0.0, "ner_coverage_pct": 0.0},
+    )
+    all_fold_rows.extend(baseline_rows)
+    all_class_rows.extend(baseline_class_rows)
 
     for model in MODELS:
         for text_type in TEXT_TYPES:
@@ -418,28 +449,44 @@ def main() -> None:
             embedding_features = load_embedding(embedding_path, "embedding")
 
             # Merge every source onto the exact same chronological target dates.
-            base = targets[["date", "volatility_class", "realized_vol"]].copy()
+            base = targets[["date", "volatility_class", "realized_vol", *JISDOR_FEATURES]].copy()
+            price_cols = JISDOR_FEATURES
             merged_embedding = base.merge(embedding_features, on="date", how="left", validate="one_to_one")
             emb_cols = [c for c in embedding_features.columns if c != "date"]
             emb_missing = merged_embedding[emb_cols].isna().all(axis=1)
-            X_embedding = merged_embedding[emb_cols].fillna(0.0).to_numpy(dtype=np.float32)
+            X_embedding = merged_embedding[price_cols + emb_cols].fillna(0.0).to_numpy(dtype=np.float32)
 
             merged_topic = base.merge(embedding_features, on="date", how="left", validate="one_to_one")
             merged_topic = merged_topic.merge(topic_features, on="date", how="left", validate="one_to_one")
             topic_cols = [c for c in topic_features.columns if c != "date"]
             topic_missing = merged_topic[topic_cols].isna().all(axis=1)
-            X_embedding_topic = merged_topic[emb_cols + topic_cols].fillna(0.0).to_numpy(dtype=np.float32)
+            X_embedding_topic = merged_topic[price_cols + emb_cols + topic_cols].fillna(0.0).to_numpy(dtype=np.float32)
 
             merged_ner = base.merge(embedding_features, on="date", how="left", validate="one_to_one")
             merged_ner = merged_ner.merge(ner_features, on="date", how="left", validate="one_to_one")
             ner_cols = [c for c in ner_features.columns if c != "date"]
             ner_missing = merged_ner[ner_cols].isna().all(axis=1)
-            X_embedding_ner = merged_ner[emb_cols + ner_cols].fillna(0.0).to_numpy(dtype=np.float32)
+            X_embedding_ner = merged_ner[price_cols + emb_cols + ner_cols].fillna(0.0).to_numpy(dtype=np.float32)
 
             merged_all = base.merge(embedding_features, on="date", how="left", validate="one_to_one")
             merged_all = merged_all.merge(topic_features, on="date", how="left", validate="one_to_one")
             merged_all = merged_all.merge(ner_features, on="date", how="left", validate="one_to_one")
-            X_all = merged_all[emb_cols + topic_cols + ner_cols].fillna(0.0).to_numpy(dtype=np.float32)
+            X_all = merged_all[price_cols + emb_cols + topic_cols + ner_cols].fillna(0.0).to_numpy(dtype=np.float32)
+
+            temporal_cols = [c for c in temporal_features.columns if c != "date"]
+            merged_temporal = base.merge(embedding_features, on="date", how="left", validate="one_to_one")
+            merged_temporal = merged_temporal.merge(temporal_features, on="date", how="left", validate="one_to_one")
+            temporal_missing = merged_temporal[temporal_cols].isna().all(axis=1)
+            X_embedding_temporal = merged_temporal[price_cols + emb_cols + temporal_cols].fillna(0.0).to_numpy(dtype=np.float32)
+
+            merged_topic_temporal = merged_temporal.merge(topic_features, on="date", how="left", validate="one_to_one")
+            X_embedding_topic_temporal = merged_topic_temporal[price_cols + emb_cols + topic_cols + temporal_cols].fillna(0.0).to_numpy(dtype=np.float32)
+
+            merged_ner_temporal = merged_temporal.merge(ner_features, on="date", how="left", validate="one_to_one")
+            X_embedding_ner_temporal = merged_ner_temporal[price_cols + emb_cols + ner_cols + temporal_cols].fillna(0.0).to_numpy(dtype=np.float32)
+
+            merged_all_temporal = merged_all.merge(temporal_features, on="date", how="left", validate="one_to_one")
+            X_all_temporal = merged_all_temporal[price_cols + emb_cols + topic_cols + ner_cols + temporal_cols].fillna(0.0).to_numpy(dtype=np.float32)
 
             y = base["volatility_class"].to_numpy()
             dates = base["date"].reset_index(drop=True)
@@ -447,12 +494,17 @@ def main() -> None:
                 "embedding_coverage_pct": float(100 * (~emb_missing).mean()),
                 "topic_coverage_pct": float(100 * (~topic_missing).mean()),
                 "ner_coverage_pct": float(100 * (~ner_missing).mean()),
+                "temporal_coverage_pct": float(100 * (~temporal_missing).mean()),
             }
             configurations = {
-                "E1_embedding_only": X_embedding,
-                "E2_embedding_plus_topic": X_embedding_topic,
-                "E3_embedding_plus_ner": X_embedding_ner,
-                "E4_embedding_plus_topic_ner": X_all,
+                "E1_jisdor_plus_embedding": X_embedding,
+                "E2_jisdor_plus_embedding_topic": X_embedding_topic,
+                "E3_jisdor_plus_embedding_ner": X_embedding_ner,
+                "E4_jisdor_plus_embedding_topic_ner": X_all,
+                "E5_jisdor_plus_embedding_temporal": X_embedding_temporal,
+                "E6_jisdor_plus_embedding_topic_temporal": X_embedding_topic_temporal,
+                "E7_jisdor_plus_embedding_ner_temporal": X_embedding_ner_temporal,
+                "E8_jisdor_plus_embedding_topic_ner_temporal": X_all_temporal,
             }
 
             for experiment, matrix in configurations.items():
@@ -463,7 +515,6 @@ def main() -> None:
                     text_type=text_type,
                     experiment=experiment,
                     feature_coverage=coverage,
-                    n_splits=n_splits,
                 )
                 all_fold_rows.extend(fold_rows)
                 all_class_rows.extend(class_rows)
@@ -489,17 +540,21 @@ def main() -> None:
         "topic_model": TOPIC_MODEL,
         "topic_file": str(TOPIC_FILE),
         "ner_file": str(NER_FILE),
+        "temporal_file": str(TEMPORAL_FILE),
         "embedding_dir": str(EMBEDDING_DIR),
         "experiments": {name: list(features) for name, features in EXPERIMENTS.items()},
         "models": list(MODELS),
         "text_types": list(TEXT_TYPES),
-        "n_splits": n_splits,
-        "split_strategy": "TimeSeriesSplit (chronological, no shuffle)",
-        "classifier": "SimpleImputer(0) + StandardScaler + LogisticRegression(class_weight=balanced, L2)",
+        "split_strategy": "chronological fixed split: 70% train, 15% validation, 15% test",
+        "train_fraction": TRAIN_FRAC,
+        "validation_fraction": VALID_FRAC,
+        "test_fraction": 1 - TRAIN_FRAC - VALID_FRAC,
+        "classifiers": ["StandardScaler + LogisticRegression(class_weight=balanced, L2)", "SimpleImputer + XGBoost multiclass"],
+        "jisdor_feature_columns": JISDOR_FEATURES,
         "n_target_rows": int(len(targets)),
         "class_distribution": {k: int(v) for k, v in targets["volatility_class"].value_counts().items()},
         "skipped_embedding_files": skipped,
-        "caveat": "Topic models were generated before this supervised evaluation. If topic models were fitted on the full time span, topic feature extraction is transductive; for strict forecasting claims, refit topic models inside each chronological training fold.",
+        "caveat": "Topic models were generated before this supervised evaluation. If topic models were fitted on the full time span, topic feature extraction is transductive; for strict forecasting claims, fit topic models using only the 70% training period before transforming validation/test.",
     }
     with (OUTPUT_DIR / "feature_fusion_metadata.json").open("w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
@@ -510,7 +565,7 @@ def main() -> None:
     logger.info("Class metrics: %s", class_path)
     logger.info("Metadata     : %s", OUTPUT_DIR / "feature_fusion_metadata.json")
     print("\nTop configurations by macro-F1:")
-    print(summary_df[["model", "text_type", "experiment", "macro_f1_mean", "balanced_accuracy_mean", "delta_macro_f1_vs_embedding_only"]].head(20).to_string(index=False))
+    print(summary_df[["model", "text_type", "classifier", "experiment", "macro_f1_mean", "balanced_accuracy_mean", "delta_macro_f1_vs_jisdor_price_only"]].head(20).to_string(index=False))
 
 
 if __name__ == "__main__":

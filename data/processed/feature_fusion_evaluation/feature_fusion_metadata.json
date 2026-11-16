@@ -5,23 +5,55 @@
   "topic_model": "lda",
   "topic_file": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/topic_modelling/lda/daily_topic_features.csv",
   "ner_file": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/ner/daily_entity_features.csv",
+  "temporal_file": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/temporal_aggregation/doc2vec_fulltext/doc2vec_fulltext_A0_daily_mean.csv",
   "embedding_dir": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/head_vs_full",
   "experiments": {
-    "E1_embedding_only": [
+    "E0_jisdor_price_only": [
+      "jisdor"
+    ],
+    "E1_jisdor_plus_embedding": [
+      "jisdor",
       "embedding"
     ],
-    "E2_embedding_plus_topic": [
+    "E2_jisdor_plus_embedding_topic": [
+      "jisdor",
       "embedding",
       "topic"
     ],
-    "E3_embedding_plus_ner": [
+    "E3_jisdor_plus_embedding_ner": [
+      "jisdor",
       "embedding",
       "ner"
     ],
-    "E4_embedding_plus_topic_ner": [
+    "E4_jisdor_plus_embedding_topic_ner": [
+      "jisdor",
       "embedding",
       "topic",
       "ner"
+    ],
+    "E5_jisdor_plus_embedding_temporal": [
+      "jisdor",
+      "embedding",
+      "temporal"
+    ],
+    "E6_jisdor_plus_embedding_topic_temporal": [
+      "jisdor",
+      "embedding",
+      "topic",
+      "temporal"
+    ],
+    "E7_jisdor_plus_embedding_ner_temporal": [
+      "jisdor",
+      "embedding",
+      "ner",
+      "temporal"
+    ],
+    "E8_jisdor_plus_embedding_topic_ner_temporal": [
+      "jisdor",
+      "embedding",
+      "topic",
+      "ner",
+      "temporal"
     ]
   },
   "models": [
@@ -33,9 +65,26 @@
     "headline",
     "fulltext"
   ],
-  "n_splits": 5,
-  "split_strategy": "TimeSeriesSplit (chronological, no shuffle)",
-  "classifier": "SimpleImputer(0) + StandardScaler + LogisticRegression(class_weight=balanced, L2)",
+  "split_strategy": "chronological fixed split: 70% train, 15% validation, 15% test",
+  "train_fraction": 0.7,
+  "validation_fraction": 0.15,
+  "test_fraction": 0.15000000000000005,
+  "classifiers": [
+    "StandardScaler + LogisticRegression(class_weight=balanced, L2)",
+    "SimpleImputer + XGBoost multiclass"
+  ],
+  "jisdor_feature_columns": [
+    "jisdor_lag1_log_return",
+    "jisdor_lag2_log_return",
+    "jisdor_lag3_log_return",
+    "jisdor_lag4_log_return",
+    "jisdor_known4_mean",
+    "jisdor_known4_std",
+    "jisdor_vol_if_r0",
+    "jisdor_vol_if_rtyp_pos",
+    "jisdor_vol_if_rtyp_neg",
+    "jisdor_lag1_volatility_class"
+  ],
   "n_target_rows": 1197,
   "class_distribution": {
     "low": 410,
@@ -43,5 +92,5 @@
     "medium": 385
   },
   "skipped_embedding_files": [],
-  "caveat": "Topic models were generated before this supervised evaluation. If topic models were fitted on the full time span, topic feature extraction is transductive; for strict forecasting claims, refit topic models inside each chronological training fold."
+  "caveat": "Topic models were generated before this supervised evaluation. If topic models were fitted on the full time span, topic feature extraction is transductive; for strict forecasting claims, fit topic models using only the 70% training period before transforming validation/test."
 }

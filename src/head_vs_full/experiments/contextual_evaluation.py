@@ -24,9 +24,9 @@ from sklearn.metrics import (
     r2_score,
 )
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from xgboost import XGBClassifier
 
 
 # ============================================================
@@ -45,20 +45,19 @@ MODEL_GROUPS = {
     "qwen": "general_purpose",
 }
 TEXT_TYPES = ("headline", "fulltext")
-N_SPLITS = 5
-LOGISTIC_C = 1.0
+TRAIN_FRAC = 0.70
+VALID_FRAC = 0.15
 RIDGE_ALPHA = 1.0
 RANDOM_STATE = 42
 
 # Financial-history predictors only. All selected predictors must be lagged.
 # They are used for the market-only baseline and market + embedding experiment.
 MARKET_LAG_CANDIDATES = [
-    "lag1_log_return",
-    "lag2_log_return",
-    "lag3_log_return",
-    "lag1_realized_vol",
-    "lag2_realized_vol",
-    "lag3_realized_vol",
+    "jisdor_lag1_log_return", "jisdor_lag2_log_return",
+    "jisdor_lag3_log_return", "jisdor_lag4_log_return",
+    "jisdor_known4_mean", "jisdor_known4_std",
+    "jisdor_vol_if_r0", "jisdor_vol_if_rtyp_pos",
+    "jisdor_vol_if_rtyp_neg", "jisdor_lag1_volatility_class",
 ]
 
 CLASS_ORDER = ["low", "medium", "high"]
@@ -351,21 +350,46 @@ def load_targets() -> pd.DataFrame:
 
     if target.empty:
         raise ValueError("Tidak ada baris target volatilitas valid setelah preprocessing.")
+    # Market predictors must be known before the forecast day.  In particular,
+    # do not include log_return(t), realized_vol(t), or kurs(t) as features.
+    returns = target["log_return"]
+    known = pd.concat([returns.shift(i) for i in (1, 2, 3, 4)], axis=1)
+    for lag in (1, 2, 3, 4):
+        target[f"jisdor_lag{lag}_log_return"] = returns.shift(lag)
+    target["jisdor_known4_mean"] = known.mean(axis=1, skipna=False)
+    target["jisdor_known4_std"] = known.std(axis=1, skipna=False)
+
+    def volatility_if(current_return: np.ndarray) -> np.ndarray:
+        return np.std(np.column_stack([known.to_numpy(), current_return]), axis=1, ddof=1)
+
+    typical_abs_return = returns.abs().expanding().median().shift(1).to_numpy()
+    target["jisdor_vol_if_r0"] = volatility_if(np.zeros(len(target)))
+    target["jisdor_vol_if_rtyp_pos"] = volatility_if(typical_abs_return)
+    target["jisdor_vol_if_rtyp_neg"] = volatility_if(-typical_abs_return)
+    target["jisdor_lag1_volatility_class"] = target["volatility_class"].map(
+        {label: index for index, label in enumerate(CLASS_ORDER)}
+    ).shift(1)
     return target.reset_index(drop=True)
 
 
-def make_classifier() -> Pipeline:
-    return Pipeline([
-        ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
-        ("scaler", StandardScaler()),
-        ("model", LogisticRegression(
-            C=LOGISTIC_C,
-            max_iter=5000,
-            class_weight="balanced",
-            solver="lbfgs",
-            random_state=RANDOM_STATE,
-        )),
-    ])
+def make_classifiers() -> dict[str, Pipeline]:
+    """Return both classifiers; each receives the exact same JISDOR + text features."""
+    return {
+        "logistic_regression": Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scaler", StandardScaler()),
+            ("model", LogisticRegression(max_iter=5000, class_weight="balanced", random_state=RANDOM_STATE)),
+        ]),
+        "xgboost": Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("model", XGBClassifier(
+                objective="multi:softprob", num_class=len(CLASS_ORDER),
+                n_estimators=300, max_depth=3, learning_rate=0.05,
+                subsample=0.8, colsample_bytree=0.8, eval_metric="mlogloss",
+                random_state=RANDOM_STATE, n_jobs=-1,
+            )),
+        ]),
+    }
 
 
 def make_regressor() -> Pipeline:
@@ -462,74 +486,66 @@ def evaluate_feature_set(
     model_group: str,
     text_type: str,
     scenario: str,
-    n_splits: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     fold_rows: list[dict[str, Any]] = []
     class_rows: list[dict[str, Any]] = []
     confusion_rows: list[dict[str, Any]] = []
 
-    splitter = TimeSeriesSplit(n_splits=n_splits)
-    for fold, (train_idx, test_idx) in enumerate(splitter.split(X), start=1):
+    train_end = int(len(X) * TRAIN_FRAC)
+    valid_end = train_end + int(len(X) * VALID_FRAC)
+    splitter = [
+        ("validation", np.arange(train_end), np.arange(train_end, valid_end)),
+        ("test", np.arange(train_end), np.arange(valid_end, len(X))),
+    ]
+    for evaluation_split, train_idx, test_idx in splitter:
         y_train = y[train_idx]
         y_test = y[test_idx]
 
         if np.unique(y_train).size < 2:
-            warnings.warn(f"Skip classification {model_name}/{scenario}, fold {fold}: train hanya memiliki satu kelas.")
+            warnings.warn(f"Skip classification {model_name}/{scenario}/{evaluation_split}: train hanya memiliki satu kelas.")
         else:
-            clf = make_classifier()
-            clf.fit(X[train_idx], y_train)
-            pred = clf.predict(X[test_idx])
-            metrics = classification_metrics(y_test, pred)
-            fold_rows.append({
-                "model": model_name,
-                "model_group": model_group,
-                "text_type": text_type,
-                "scenario": scenario,
-                "fold": fold,
-                "task": "classification_volatility",
-                "train_start": str(dates.iloc[train_idx].min().date()),
-                "train_end": str(dates.iloc[train_idx].max().date()),
-                "test_start": str(dates.iloc[test_idx].min().date()),
-                "test_end": str(dates.iloc[test_idx].max().date()),
-                "n_train": int(len(train_idx)),
-                "n_test": int(len(test_idx)),
-                **metrics,
-            })
-
-            report = classification_report(
-                y_test,
-                pred,
-                labels=CLASS_ORDER,
-                output_dict=True,
-                zero_division=0,
-            )
-            for label in CLASS_ORDER:
-                class_rows.append({
+            class_to_index = {label: index for index, label in enumerate(CLASS_ORDER)}
+            y_train_encoded = np.asarray([class_to_index[label] for label in y_train], dtype=int)
+            for classifier_name, clf in make_classifiers().items():
+                pred_encoded = clf.fit(X[train_idx], y_train_encoded).predict(X[test_idx]).astype(int)
+                pred = np.asarray([CLASS_ORDER[index] for index in pred_encoded])
+                metrics = classification_metrics(y_test, pred)
+                fold_rows.append({
                     "model": model_name,
                     "model_group": model_group,
                     "text_type": text_type,
                     "scenario": scenario,
-                    "fold": fold,
-                    "class": label,
-                    "precision": report[label]["precision"],
-                    "recall": report[label]["recall"],
-                    "f1_score": report[label]["f1-score"],
-                    "support": report[label]["support"],
+                    "classifier": classifier_name,
+                    "fold": evaluation_split,
+                    "evaluation_split": evaluation_split,
+                    "task": "classification_volatility",
+                    "train_start": str(dates.iloc[train_idx].min().date()),
+                    "train_end": str(dates.iloc[train_idx].max().date()),
+                    "test_start": str(dates.iloc[test_idx].min().date()),
+                    "test_end": str(dates.iloc[test_idx].max().date()),
+                    "n_train": int(len(train_idx)),
+                    "n_test": int(len(test_idx)),
+                    **metrics,
                 })
 
-            cm = confusion_matrix(y_test, pred, labels=CLASS_ORDER)
-            for i, actual in enumerate(CLASS_ORDER):
-                for j, predicted in enumerate(CLASS_ORDER):
-                    confusion_rows.append({
-                        "model": model_name,
-                        "model_group": model_group,
-                        "text_type": text_type,
-                        "scenario": scenario,
-                        "fold": fold,
-                        "actual": actual,
-                        "predicted": predicted,
-                        "count": int(cm[i, j]),
+                report = classification_report(y_test, pred, labels=CLASS_ORDER, output_dict=True, zero_division=0)
+                for label in CLASS_ORDER:
+                    class_rows.append({
+                        "model": model_name, "model_group": model_group,
+                        "text_type": text_type, "scenario": scenario,
+                        "classifier": classifier_name, "fold": evaluation_split, "evaluation_split": evaluation_split, "class": label,
+                        "precision": report[label]["precision"], "recall": report[label]["recall"],
+                        "f1_score": report[label]["f1-score"], "support": report[label]["support"],
                     })
+                cm = confusion_matrix(y_test, pred, labels=CLASS_ORDER)
+                for i, actual in enumerate(CLASS_ORDER):
+                    for j, predicted in enumerate(CLASS_ORDER):
+                        confusion_rows.append({
+                            "model": model_name, "model_group": model_group,
+                            "text_type": text_type, "scenario": scenario,
+                            "classifier": classifier_name, "fold": evaluation_split, "evaluation_split": evaluation_split,
+                            "actual": actual, "predicted": predicted, "count": int(cm[i, j]),
+                        })
 
         # Regression on continuous realized volatility is evaluated independently.
         reg = make_regressor()
@@ -540,7 +556,8 @@ def evaluate_feature_set(
             "model_group": model_group,
             "text_type": text_type,
             "scenario": scenario,
-            "fold": fold,
+            "fold": evaluation_split,
+            "evaluation_split": evaluation_split,
             "task": "regression_realized_volatility",
             "train_start": str(dates.iloc[train_idx].min().date()),
             "train_end": str(dates.iloc[train_idx].max().date()),
@@ -565,7 +582,7 @@ def summarize_results(fold_df: pd.DataFrame) -> pd.DataFrame:
         "f1_low", "f1_medium", "f1_high", "mae", "rmse", "r2",
     ]
     rows: list[dict[str, Any]] = []
-    keys = ["model", "model_group", "text_type", "scenario", "task"]
+    keys = ["model", "model_group", "text_type", "scenario", "classifier", "task", "evaluation_split"]
     for key_values, group in fold_df.groupby(keys, dropna=False):
         row = dict(zip(keys, key_values))
         row["n_folds"] = int(len(group))
@@ -582,12 +599,12 @@ def summarize_results(fold_df: pd.DataFrame) -> pd.DataFrame:
 def build_domain_general_comparison(summary_df: pd.DataFrame) -> pd.DataFrame:
     subset = summary_df[
         (summary_df["task"] == "classification_volatility")
-        & (summary_df["scenario"].isin(["embedding_only", "market_plus_embedding"]))
+        & (summary_df["scenario"] == "jisdor_plus_embedding")
     ].copy()
     if subset.empty:
         return pd.DataFrame()
 
-    grouped = subset.groupby(["text_type", "scenario", "model_group"], as_index=False).agg(
+    grouped = subset.groupby(["classifier", "text_type", "scenario", "evaluation_split", "model_group"], as_index=False).agg(
         n_models=("model", "nunique"),
         macro_f1_mean=("macro_f1_mean", "mean"),
         macro_f1_between_model_std=("macro_f1_mean", "std"),
@@ -597,7 +614,7 @@ def build_domain_general_comparison(summary_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     pivot = grouped.pivot_table(
-        index=["text_type", "scenario"],
+        index=["classifier", "text_type", "scenario", "evaluation_split"],
         columns="model_group",
         values="macro_f1_mean",
         aggfunc="first",
@@ -605,8 +622,8 @@ def build_domain_general_comparison(summary_df: pd.DataFrame) -> pd.DataFrame:
     if "domain_specific" in pivot.columns and "general_purpose" in pivot.columns:
         pivot["finbert_minus_general_macro_f1"] = pivot["domain_specific"] - pivot["general_purpose"]
     return grouped.merge(
-        pivot[[c for c in ["text_type", "scenario", "finbert_minus_general_macro_f1"] if c in pivot.columns]],
-        on=["text_type", "scenario"],
+        pivot[[c for c in ["classifier", "text_type", "scenario", "evaluation_split", "finbert_minus_general_macro_f1"] if c in pivot.columns]],
+        on=["classifier", "text_type", "scenario", "evaluation_split"],
         how="left",
     )
 
@@ -663,14 +680,12 @@ def main() -> None:
         y_all = targets["volatility_class"].astype(str).to_numpy()
         realized_vol_all = targets["realized_vol"].to_numpy(dtype=np.float64)
         dates_all = targets["date"].reset_index(drop=True)
-        n_splits = min(N_SPLITS, max(2, len(targets) - 1))
         rows, class_rows, cm_rows = evaluate_feature_set(
             market_matrix, y_all, realized_vol_all, dates_all,
             model_name="market_baseline",
             model_group="baseline",
             text_type="all",
             scenario="market_only",
-            n_splits=n_splits,
         )
         all_fold_rows.extend(rows)
         all_class_rows.extend(class_rows)
@@ -713,12 +728,9 @@ def main() -> None:
         )
         diagnostic_rows.append(diagnostic)
         pca_projection_rows.append(pca_projection)
-        n_splits = min(N_SPLITS, max(2, len(merged) - 1))
-
-        scenarios = [("embedding_only", X_embedding)]
-        if market_matrix is not None and market_matrix.shape[1] > 0:
-            X_combined = np.hstack([market_matrix, X_embedding])
-            scenarios.append(("market_plus_embedding", X_combined))
+        if market_matrix is None or market_matrix.shape[1] == 0:
+            raise RuntimeError("Fitur JISDOR tidak tersedia; evaluasi headline/fulltext tidak boleh berjalan tanpa harga.")
+        scenarios = [("jisdor_plus_embedding", np.hstack([market_matrix, X_embedding]))]
 
         for scenario, X in scenarios:
             log(f"  Evaluating: {scenario}")
@@ -728,7 +740,6 @@ def main() -> None:
                 model_group=MODEL_GROUPS[model],
                 text_type=text_type,
                 scenario=scenario,
-                n_splits=n_splits,
             )
             all_fold_rows.extend(rows)
             all_class_rows.extend(class_rows)
@@ -766,11 +777,12 @@ def main() -> None:
         "output_dir": str(OUTPUT_DIR),
         "n_target_rows": int(len(targets)),
         "target_class_distribution": {k: int(v) for k, v in targets["volatility_class"].value_counts().items()},
-        "n_splits": N_SPLITS,
-        "split_strategy": "TimeSeriesSplit (chronological; no random shuffle)",
-        "classification_model": "StandardScaler + LogisticRegression(class_weight='balanced', L2)",
+        "split_strategy": "chronological fixed split: 70% train, 15% validation, 15% test",
+        "train_fraction": TRAIN_FRAC,
+        "validation_fraction": VALID_FRAC,
+        "test_fraction": 1 - TRAIN_FRAC - VALID_FRAC,
+        "classification_models": ["StandardScaler + LogisticRegression", "SimpleImputer + XGBoost multiclass"],
         "regression_model": "StandardScaler + Ridge on realized_vol",
-        "logistic_C": LOGISTIC_C,
         "ridge_alpha": RIDGE_ALPHA,
         "model_groups": MODEL_GROUPS,
         "market_lag_columns": available_market_cols,

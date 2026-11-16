@@ -7,11 +7,15 @@
     "high": 402,
     "medium": 385
   },
-  "n_splits": 5,
-  "split_strategy": "TimeSeriesSplit (chronological; no random shuffle)",
-  "classification_model": "StandardScaler + LogisticRegression(class_weight='balanced', L2)",
+  "split_strategy": "chronological fixed split: 70% train, 15% validation, 15% test",
+  "train_fraction": 0.7,
+  "validation_fraction": 0.15,
+  "test_fraction": 0.15000000000000005,
+  "classification_models": [
+    "StandardScaler + LogisticRegression",
+    "SimpleImputer + XGBoost multiclass"
+  ],
   "regression_model": "StandardScaler + Ridge on realized_vol",
-  "logistic_C": 1.0,
   "ridge_alpha": 1.0,
   "model_groups": {
     "finbert": "domain_specific",
@@ -19,10 +23,16 @@
     "qwen": "general_purpose"
   },
   "market_lag_columns": [
-    "lag1_log_return",
-    "lag2_log_return",
-    "lag3_log_return",
-    "lag1_realized_vol"
+    "jisdor_lag1_log_return",
+    "jisdor_lag2_log_return",
+    "jisdor_lag3_log_return",
+    "jisdor_lag4_log_return",
+    "jisdor_known4_mean",
+    "jisdor_known4_std",
+    "jisdor_vol_if_r0",
+    "jisdor_vol_if_rtyp_pos",
+    "jisdor_vol_if_rtyp_neg",
+    "jisdor_lag1_volatility_class"
   ],
   "feature_files": {
     "qwen_headline": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/head_vs_full/headline/qwen_headline_features.csv",
