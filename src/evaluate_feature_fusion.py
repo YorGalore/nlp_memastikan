@@ -4,6 +4,7 @@ import ast
 import json
 import logging
 import re
+import sys
 import warnings
 from pathlib import Path
 from typing import Any
@@ -21,9 +22,12 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+# Split resmi 70/15/15 (hari, label, batas tanggal sama dengan Tugas 2).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from dataset_split import canonical_split  # noqa: E402
 
 
 # ============================================================
@@ -33,7 +37,9 @@ from sklearn.preprocessing import StandardScaler
 MODELS = ("finbert", "roberta", "qwen")
 TEXT_TYPES = ("headline", "fulltext")
 CLASS_ORDER = ("low", "medium", "high")
-N_SPLITS = 5
+# Fit di TRAIN, evaluasi terpisah di VALID dan TEST (split 70/15/15).
+# Ranking/pemilihan konfigurasi WAJIB memakai VALID; TEST hanya dilaporkan.
+EVAL_SPLITS = ("valid", "test")
 RANDOM_STATE = 42
 LOGISTIC_C = 1.0
 
@@ -113,51 +119,12 @@ def load_targets() -> pd.DataFrame:
     if not TARGET_FILE.exists():
         raise FileNotFoundError(f"Target file tidak ditemukan: {TARGET_FILE}")
 
-    target = pd.read_csv(TARGET_FILE)
-    required = {"date", "log_return"}
-    missing = required - set(target.columns)
-    if missing:
-        raise ValueError(f"Kolom wajib tidak ada di aligned_daily.csv: {sorted(missing)}")
-
-    target["date"] = pd.to_datetime(target["date"], errors="coerce").dt.normalize()
-    target["log_return"] = pd.to_numeric(target["log_return"], errors="coerce")
-    target = target.dropna(subset=["date"]).sort_values("date")
-    target = target.drop_duplicates("date", keep="last").reset_index(drop=True)
-
-    if "realized_vol" in target.columns:
-        target["realized_vol"] = pd.to_numeric(target["realized_vol"], errors="coerce")
-    else:
-        target["realized_vol"] = target["log_return"].rolling(5, min_periods=5).std()
-
-    if "volatility_class" in target.columns:
-        labels = target["volatility_class"].astype(str).str.strip().str.lower()
-        labels = labels.where(labels.isin(CLASS_ORDER), np.nan)
-    else:
-        labels = pd.Series(np.nan, index=target.index, dtype="object")
-
-    # Recreate the project rule if labels are absent or incomplete:
-    # tertile cutoffs fitted on the earliest 70% of valid chronological rows.
-    if labels.isna().any():
-        valid_vol = target["realized_vol"].notna()
-        values = target.loc[valid_vol, "realized_vol"]
-        if len(values) < 3:
-            raise ValueError("Tidak cukup data realized_vol untuk membentuk tiga kelas.")
-        calibration_n = max(3, int(np.floor(len(values) * 0.70)))
-        q_low, q_high = values.iloc[:calibration_n].quantile([1 / 3, 2 / 3]).to_numpy()
-        if not np.isfinite(q_low) or not np.isfinite(q_high) or q_low >= q_high:
-            raise ValueError("Threshold tertile realized_vol tidak valid.")
-        labels = pd.cut(
-            target["realized_vol"],
-            bins=[-np.inf, q_low, q_high, np.inf],
-            labels=CLASS_ORDER,
-            include_lowest=True,
-        ).astype("object")
-
-    target["volatility_class"] = labels
-    target = target.dropna(subset=["realized_vol", "volatility_class"])
+    # Hari, volatility_class, dan kolom split diambil dari split resmi
+    # (dataset_split.canonical_split) -- identik dengan train_combined.py.
+    target = canonical_split()
+    target["date"] = pd.to_datetime(target["date"]).dt.normalize()
     target = target[target["volatility_class"].isin(CLASS_ORDER)].copy()
-    target["volatility_class"] = target["volatility_class"].astype(str)
-    return target[["date", "volatility_class", "realized_vol"]].reset_index(drop=True)
+    return target[["date", "split", "volatility_class", "realized_vol"]].sort_values("date").reset_index(drop=True)
 
 
 def normalize_date(df: pd.DataFrame, path: Path) -> tuple[pd.DataFrame, str]:
@@ -291,25 +258,29 @@ def evaluate_one_configuration(
     X: np.ndarray,
     y: np.ndarray,
     dates: pd.Series,
+    split: np.ndarray,
     *,
     model: str,
     text_type: str,
     experiment: str,
     feature_coverage: dict[str, float],
-    n_splits: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fit sekali di TRAIN, lalu evaluasi terpisah di VALID dan TEST (70/15/15)."""
     fold_rows: list[dict[str, Any]] = []
     class_rows: list[dict[str, Any]] = []
-    splitter = TimeSeriesSplit(n_splits=n_splits)
 
-    for fold, (train_idx, test_idx) in enumerate(splitter.split(X), start=1):
-        y_train, y_test = y[train_idx], y[test_idx]
-        if np.unique(y_train).size < 2:
-            warnings.warn(f"Skip {model}/{text_type}/{experiment}/fold-{fold}: train hanya punya satu kelas.")
-            continue
+    train_idx = np.flatnonzero(split == "train")
+    y_train = y[train_idx]
+    if np.unique(y_train).size < 2:
+        warnings.warn(f"Skip {model}/{text_type}/{experiment}: train hanya punya satu kelas.")
+        return fold_rows, class_rows
 
-        clf = make_classifier()
-        clf.fit(X[train_idx], y_train)
+    clf = make_classifier()
+    clf.fit(X[train_idx], y_train)
+
+    for fold in EVAL_SPLITS:
+        test_idx = np.flatnonzero(split == fold)
+        y_test = y[test_idx]
         pred = clf.predict(X[test_idx])
         report = classification_report(
             y_test, pred, labels=CLASS_ORDER, output_dict=True, zero_division=0
@@ -318,7 +289,7 @@ def evaluate_one_configuration(
             "model": model,
             "text_type": text_type,
             "experiment": experiment,
-            "fold": fold,
+            "eval_split": fold,
             "n_train": int(len(train_idx)),
             "n_test": int(len(test_idx)),
             "train_start": str(dates.iloc[train_idx].min().date()),
@@ -344,7 +315,7 @@ def evaluate_one_configuration(
                 "model": model,
                 "text_type": text_type,
                 "experiment": experiment,
-                "fold": fold,
+                "eval_split": fold,
                 "class": label,
                 "precision": float(report[label]["precision"]),
                 "recall": float(report[label]["recall"]),
@@ -362,28 +333,32 @@ def summarize(folds: pd.DataFrame) -> pd.DataFrame:
         "accuracy", "balanced_accuracy", "macro_precision", "macro_recall",
         "macro_f1", "weighted_f1", "f1_low", "f1_medium", "f1_high",
     ]
-    group_cols = ["model", "text_type", "experiment"]
+    # Satu baris per (model, text_type, experiment, eval_split). Nama kolom
+    # *_mean dipertahankan supaya kompatibel; dengan split tunggal 70/15/15
+    # nilainya adalah skor pada eval_split tersebut (bukan rata-rata fold).
+    group_cols = ["model", "text_type", "experiment", "eval_split"]
     rows = []
     for keys, group in folds.groupby(group_cols, dropna=False):
         row = dict(zip(group_cols, keys))
-        row["n_folds"] = int(len(group))
+        row["n_eval"] = int(group["n_test"].iloc[0])
         row["n_features"] = int(group["n_features"].iloc[0])
         for metric in metric_cols:
             row[f"{metric}_mean"] = float(group[metric].mean())
-            row[f"{metric}_std"] = float(group[metric].std(ddof=1)) if len(group) > 1 else 0.0
         for col in ["embedding_coverage_pct", "topic_coverage_pct", "ner_coverage_pct"]:
             if col in group.columns:
                 row[col] = float(group[col].iloc[0])
         rows.append(row)
     result = pd.DataFrame(rows)
     baseline = result[result["experiment"] == "E1_embedding_only"][
-        ["model", "text_type", "macro_f1_mean"]
+        ["model", "text_type", "eval_split", "macro_f1_mean"]
     ].rename(columns={"macro_f1_mean": "embedding_only_macro_f1_mean"})
-    result = result.merge(baseline, on=["model", "text_type"], how="left")
+    result = result.merge(baseline, on=["model", "text_type", "eval_split"], how="left")
     result["delta_macro_f1_vs_embedding_only"] = (
         result["macro_f1_mean"] - result["embedding_only_macro_f1_mean"]
     )
-    return result.sort_values(["macro_f1_mean", "balanced_accuracy_mean"], ascending=False).reset_index(drop=True)
+    return result.sort_values(
+        ["eval_split", "macro_f1_mean", "balanced_accuracy_mean"], ascending=[False, False, False]
+    ).reset_index(drop=True)
 
 
 def main() -> None:
@@ -393,9 +368,8 @@ def main() -> None:
     logger.info("Output: %s", OUTPUT_DIR)
 
     targets = load_targets()
-    if len(targets) <= N_SPLITS:
-        raise ValueError(f"Jumlah target ({len(targets)}) tidak cukup untuk TimeSeriesSplit {N_SPLITS} folds.")
     logger.info("Target rows: %s | classes: %s", len(targets), targets["volatility_class"].value_counts().to_dict())
+    logger.info("Split sizes: %s", targets["split"].value_counts().to_dict())
 
     # Topic and NER are loaded once and reused for each embedding configuration.
     topic_features = load_daily_numeric_features(TOPIC_FILE, "topic", one_hot_dominant_topic=True)
@@ -404,7 +378,6 @@ def main() -> None:
     all_fold_rows: list[dict[str, Any]] = []
     all_class_rows: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
-    n_splits = min(N_SPLITS, len(targets) - 1)
 
     for model in MODELS:
         for text_type in TEXT_TYPES:
@@ -418,7 +391,7 @@ def main() -> None:
             embedding_features = load_embedding(embedding_path, "embedding")
 
             # Merge every source onto the exact same chronological target dates.
-            base = targets[["date", "volatility_class", "realized_vol"]].copy()
+            base = targets[["date", "split", "volatility_class", "realized_vol"]].copy()
             merged_embedding = base.merge(embedding_features, on="date", how="left", validate="one_to_one")
             emb_cols = [c for c in embedding_features.columns if c != "date"]
             emb_missing = merged_embedding[emb_cols].isna().all(axis=1)
@@ -443,6 +416,7 @@ def main() -> None:
 
             y = base["volatility_class"].to_numpy()
             dates = base["date"].reset_index(drop=True)
+            split = base["split"].to_numpy()
             coverage = {
                 "embedding_coverage_pct": float(100 * (~emb_missing).mean()),
                 "topic_coverage_pct": float(100 * (~topic_missing).mean()),
@@ -458,12 +432,11 @@ def main() -> None:
             for experiment, matrix in configurations.items():
                 logger.info("Evaluate %s | %s | %s | shape=%s", model, text_type, experiment, matrix.shape)
                 fold_rows, class_rows = evaluate_one_configuration(
-                    matrix, y, dates,
+                    matrix, y, dates, split,
                     model=model,
                     text_type=text_type,
                     experiment=experiment,
                     feature_coverage=coverage,
-                    n_splits=n_splits,
                 )
                 all_fold_rows.extend(fold_rows)
                 all_class_rows.extend(class_rows)
@@ -485,7 +458,7 @@ def main() -> None:
     metadata = {
         "target_file": str(TARGET_FILE),
         "target": "volatility_class (low/medium/high)",
-        "target_definition": "5-BI-business-day rolling standard deviation of log_return; tertile thresholds fitted on earliest 70% chronological observations, consistent with project target.",
+        "target_definition": "5-BI-business-day rolling standard deviation of log_return; volatility_class and day set taken from dataset_split.canonical_split (identical to Tugas 2).",
         "topic_model": TOPIC_MODEL,
         "topic_file": str(TOPIC_FILE),
         "ner_file": str(NER_FILE),
@@ -493,8 +466,9 @@ def main() -> None:
         "experiments": {name: list(features) for name, features in EXPERIMENTS.items()},
         "models": list(MODELS),
         "text_types": list(TEXT_TYPES),
-        "n_splits": n_splits,
-        "split_strategy": "TimeSeriesSplit (chronological, no shuffle)",
+        "eval_splits": list(EVAL_SPLITS),
+        "split_strategy": "Official chronological 70/15/15 split from dataset_split.canonical_split (fit on train; report valid and test separately; select on valid only)",
+        "split_sizes": {k: int(v) for k, v in targets["split"].value_counts().items()},
         "classifier": "SimpleImputer(0) + StandardScaler + LogisticRegression(class_weight=balanced, L2)",
         "n_target_rows": int(len(targets)),
         "class_distribution": {k: int(v) for k, v in targets["volatility_class"].value_counts().items()},
@@ -510,7 +484,7 @@ def main() -> None:
     logger.info("Class metrics: %s", class_path)
     logger.info("Metadata     : %s", OUTPUT_DIR / "feature_fusion_metadata.json")
     print("\nTop configurations by macro-F1:")
-    print(summary_df[["model", "text_type", "experiment", "macro_f1_mean", "balanced_accuracy_mean", "delta_macro_f1_vs_embedding_only"]].head(20).to_string(index=False))
+    print(summary_df[["eval_split", "model", "text_type", "experiment", "macro_f1_mean", "balanced_accuracy_mean", "delta_macro_f1_vs_embedding_only"]].head(30).to_string(index=False))
 
 
 if __name__ == "__main__":

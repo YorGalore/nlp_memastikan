@@ -1,10 +1,15 @@
 
 import logging
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from gensim.models import FastText
+
+# split resmi 70/15/15 (sama dengan Tugas 2) -- lihat dataset_split.py
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from dataset_split import split_boundaries  # noqa: E402
 
 
 # ==================================================
@@ -13,7 +18,7 @@ from gensim.models import FastText
 
 INPUT_CSV = "data/processed/aligned_daily.csv"
 
-OUTPUT_FEATURES = "data/processed/fasttext_fulltext_features.csv"
+OUTPUT_FEATURES = "data/processed/head_vs_full/fulltext/fasttext_fulltext_features.csv"
 
 MODEL_PATH = "models/fasttext_fulltext.model"
 
@@ -24,7 +29,8 @@ WINDOW = 5
 MIN_COUNT = 2
 EPOCHS = 10
 SEED = 42
-TRAIN_RATIO = 0.80
+# FastText hanya dilatih pada periode TRAIN resmi (s.d. tanggal terakhir train)
+TRAIN_END, _ = split_boundaries()
 
 WORKERS = 4
 MIN_N = 3
@@ -97,7 +103,8 @@ print(tokenized_docs[1][:20])
 # 5. TEMPORAL TRAIN-TEST SPLIT
 # ==================================================
 
-split_idx = int(len(df) * TRAIN_RATIO)
+# tanggal periode TRAIN resmi (split 70/15/15); df sudah urut tanggal
+split_idx = int((pd.to_datetime(df["date"]) <= TRAIN_END).sum())
 
 train_sentences = [
     tokens

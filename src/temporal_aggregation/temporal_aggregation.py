@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import re
+import sys
 import warnings
 
 import numpy as np
@@ -9,6 +10,10 @@ import pandas as pd
 # ----------------------------- CONFIGURATION -----------------------------
 
 ROOT = Path(__file__).resolve().parents[2]
+
+# Split resmi 70/15/15 (hari, label, batas tanggal sama dengan Tugas 2).
+sys.path.insert(0, str(ROOT / "src"))
+from dataset_split import canonical_split  # noqa: E402
 
 ALIGNED_DAILY_CSV = ROOT / "data/processed/aligned_daily.csv"
 
@@ -42,8 +47,10 @@ MODEL_OUTPUT_DIR = ROOT / "models/temporal_aggregation"
 ROLLING_WINDOWS = [3, 5, 7, 14, 30]
 EXPONENTIAL_HALF_LIVES = [1, 3, 5, 7]
 
-# Chronological split for the supervised attention module.
-ATTENTION_TRAIN_RATIO = 0.80
+# Supervised attention module (A3) dilatih HANYA pada hari TRAIN resmi
+# (split 70/15/15, lihat dataset_split.canonical_split). Valid dan test
+# tidak pernah dipakai untuk fit parameter attention.
+ATTENTION_TRAIN_SPLIT = "train"
 ATTENTION_EPOCHS = 100
 ATTENTION_LEARNING_RATE = 1e-3
 ATTENTION_WEIGHT_DECAY = 1e-4
@@ -406,11 +413,11 @@ def attention_pooling(article_df, emb_cols, calendar, target_df, model_name):
         # Only dates with at least one article are represented by a non-empty matrix.
         # Empty-news dates are assigned a zero vector after pooling.
     dates = calendar["date"].tolist()
+    # target_df = hari TRAIN resmi saja (date, volatility_class)
     y_map = target_df.set_index("date")[TARGET_COLUMN].to_dict()
     class_to_idx = {label: i for i, label in enumerate(TARGET_CLASSES)}
 
-    train_n = max(1, int(len(dates) * ATTENTION_TRAIN_RATIO))
-    train_dates = dates[:train_n]
+    train_dates = [d for d in dates if d in y_map]
 
     train_x = []
     train_y = []
@@ -548,7 +555,12 @@ def run_for_model(model_name, embedding_path, calendar, event_meta):
         save_features(a2, model_dir / f"{model_name}_A2_exp_decay_hl{half_life}d.csv")
 
     # A3: learned attention over individual articles per date
-    target_df = calendar[["date", TARGET_COLUMN]].copy()
+    # Label & hari latih = hari TRAIN resmi (split 70/15/15).
+    canonical = canonical_split()
+    target_df = canonical.loc[
+        canonical["split"] == ATTENTION_TRAIN_SPLIT, ["date", TARGET_COLUMN]
+    ].copy()
+    target_df["date"] = normalize_date(target_df["date"])
     a3 = attention_pooling(articles, emb_cols, calendar, target_df, model_name)
     save_features(a3, model_dir / f"{model_name}_A3_attention.csv")
 
@@ -567,7 +579,8 @@ def run_for_model(model_name, embedding_path, calendar, event_meta):
         "event_categories": EVENT_CATEGORIES,
         "rolling_windows_days": ROLLING_WINDOWS,
         "exponential_half_lives_days": EXPONENTIAL_HALF_LIVES,
-        "attention_train_ratio": ATTENTION_TRAIN_RATIO,
+        "attention_train_split": "official 70/15/15 train days (dataset_split.canonical_split)",
+        "attention_train_days": int(len(target_df)),
         "target_column": TARGET_COLUMN,
         "target_classes": TARGET_CLASSES,
     }

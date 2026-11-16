@@ -24,9 +24,12 @@ from sklearn.metrics import (
     r2_score,
 )
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+# Split resmi 70/15/15 (hari, label, batas tanggal sama dengan Tugas 2).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from dataset_split import canonical_split  # noqa: E402
 
 
 # ============================================================
@@ -37,7 +40,8 @@ ROOT_DIR = Path(__file__).resolve().parents[2] if Path(__file__).resolve().paren
 DATA_DIR = ROOT_DIR / "data" / "processed"
 TARGET_FILE = DATA_DIR / "aligned_daily.csv"
 FEATURE_DIR = DATA_DIR / "head_vs_full"
-OUTPUT_DIR = DATA_DIR / "contextual_embedding_volatility_evaluation"
+# folder yang sama dengan hasil yang di-commit (sebelumnya dipindah manual)
+OUTPUT_DIR = DATA_DIR / "contextual_embedding"
 
 MODEL_GROUPS = {
     "finbert": "domain_specific",
@@ -45,7 +49,9 @@ MODEL_GROUPS = {
     "qwen": "general_purpose",
 }
 TEXT_TYPES = ("headline", "fulltext")
-N_SPLITS = 5
+# Fit di TRAIN, evaluasi terpisah di VALID dan TEST (split 70/15/15).
+# Ranking/pemilihan representasi WAJIB memakai VALID; TEST hanya dilaporkan.
+EVAL_SPLITS = ("valid", "test")
 LOGISTIC_C = 1.0
 RIDGE_ALPHA = 1.0
 RANDOM_STATE = 42
@@ -278,11 +284,12 @@ def load_feature_file(path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
 
 
 def load_targets() -> pd.DataFrame:
-    """Load the project-defined volatility target.
+    """Load the project-defined volatility target and the official split.
 
-    realized_vol(t) is the standard deviation of the latest five BI business-day
-    log returns, including day t. Volatility class cutoffs are estimated from
-    the earliest 70% of chronological observations and then held fixed.
+    Hari, volatility_class, dan kolom `split` (train/valid/test) diambil dari
+    dataset_split.canonical_split() -- identik dengan train_combined.py
+    (772 / 165 / 167 hari), sehingga ambang kelas dan himpunan hari sama
+    dengan Tugas 2.
     """
     if not TARGET_FILE.exists():
         raise FileNotFoundError(
@@ -290,68 +297,13 @@ def load_targets() -> pd.DataFrame:
             "Pastikan script dijalankan dari root repository dan aligned_daily.csv tersedia."
         )
 
-    target = pd.read_csv(TARGET_FILE)
-    required = {"date", "log_return"}
-    missing = required - set(target.columns)
-    if missing:
-        raise ValueError(f"Kolom wajib tidak ada di aligned_daily.csv: {sorted(missing)}")
-
-    target["date"] = pd.to_datetime(target["date"], errors="coerce").dt.normalize()
-    target["log_return"] = pd.to_numeric(target["log_return"], errors="coerce")
-    target = target.dropna(subset=["date"]).sort_values("date")
-    target = target.drop_duplicates("date", keep="last").reset_index(drop=True)
-
-    # Prefer the report-aligned realized_vol column; derive it only if absent.
-    if "realized_vol" in target.columns:
-        target["realized_vol"] = pd.to_numeric(target["realized_vol"], errors="coerce")
-    else:
-        target["realized_vol"] = target["log_return"].rolling(
-            window=5, min_periods=5
-        ).std()
-
-    # Use an existing class column only when it contains the expected labels.
-    valid_classes = set(CLASS_ORDER)
-    if "volatility_class" in target.columns:
-        target["volatility_class"] = (
-            target["volatility_class"].astype(str).str.strip().str.lower()
-        )
-        observed_classes = set(target["volatility_class"].dropna().unique())
-        if not observed_classes.issubset(valid_classes):
-            target["volatility_class"] = np.nan
-    else:
-        target["volatility_class"] = np.nan
-
-    # If class labels are absent/invalid, reproduce the project's fixed
-    # tertile thresholds using only the earliest 70% of chronological rows.
-    if target["volatility_class"].isna().any():
-        valid_vol = target["realized_vol"].notna()
-        chronological_valid = target.loc[valid_vol, "realized_vol"]
-        if len(chronological_valid) < 3:
-            raise ValueError("Tidak cukup observasi realized_vol untuk membentuk tiga kelas volatilitas.")
-
-        calibration_n = max(3, int(np.floor(len(chronological_valid) * 0.70)))
-        calibration = chronological_valid.iloc[:calibration_n]
-        q_low, q_high = calibration.quantile([1 / 3, 2 / 3]).to_numpy()
-        if not np.isfinite(q_low) or not np.isfinite(q_high) or q_low >= q_high:
-            raise ValueError(
-                "Threshold tertile realized_vol tidak valid. Periksa distribusi realized_vol."
-            )
-        target["volatility_class"] = pd.cut(
-            target["realized_vol"],
-            bins=[-np.inf, q_low, q_high, np.inf],
-            labels=CLASS_ORDER,
-            include_lowest=True,
-        ).astype("object")
-
-    target = target.dropna(subset=["realized_vol", "volatility_class"])
+    target = canonical_split()
+    target["date"] = pd.to_datetime(target["date"]).dt.normalize()
     target = target[target["volatility_class"].isin(CLASS_ORDER)].copy()
-    target["volatility_class"] = pd.Categorical(
-        target["volatility_class"], categories=CLASS_ORDER, ordered=True
-    ).astype(str)
 
     if target.empty:
         raise ValueError("Tidak ada baris target volatilitas valid setelah preprocessing.")
-    return target.reset_index(drop=True)
+    return target.sort_values("date").reset_index(drop=True)
 
 
 def make_classifier() -> Pipeline:
@@ -457,27 +409,36 @@ def evaluate_feature_set(
     y: np.ndarray,
     realized_vol: np.ndarray,
     dates: pd.Series,
+    split: np.ndarray,
     *,
     model_name: str,
     model_group: str,
     text_type: str,
     scenario: str,
-    n_splits: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fit sekali di TRAIN, lalu evaluasi terpisah di VALID dan TEST (70/15/15)."""
     fold_rows: list[dict[str, Any]] = []
     class_rows: list[dict[str, Any]] = []
     confusion_rows: list[dict[str, Any]] = []
 
-    splitter = TimeSeriesSplit(n_splits=n_splits)
-    for fold, (train_idx, test_idx) in enumerate(splitter.split(X), start=1):
-        y_train = y[train_idx]
+    train_idx = np.flatnonzero(split == "train")
+    y_train = y[train_idx]
+
+    clf = None
+    if np.unique(y_train).size < 2:
+        warnings.warn(f"Skip classification {model_name}/{scenario}: train hanya memiliki satu kelas.")
+    else:
+        clf = make_classifier()
+        clf.fit(X[train_idx], y_train)
+
+    reg = make_regressor()
+    reg.fit(X[train_idx], realized_vol[train_idx])
+
+    for fold in EVAL_SPLITS:
+        test_idx = np.flatnonzero(split == fold)
         y_test = y[test_idx]
 
-        if np.unique(y_train).size < 2:
-            warnings.warn(f"Skip classification {model_name}/{scenario}, fold {fold}: train hanya memiliki satu kelas.")
-        else:
-            clf = make_classifier()
-            clf.fit(X[train_idx], y_train)
+        if clf is not None:
             pred = clf.predict(X[test_idx])
             metrics = classification_metrics(y_test, pred)
             fold_rows.append({
@@ -485,7 +446,7 @@ def evaluate_feature_set(
                 "model_group": model_group,
                 "text_type": text_type,
                 "scenario": scenario,
-                "fold": fold,
+                "eval_split": fold,
                 "task": "classification_volatility",
                 "train_start": str(dates.iloc[train_idx].min().date()),
                 "train_end": str(dates.iloc[train_idx].max().date()),
@@ -509,7 +470,7 @@ def evaluate_feature_set(
                     "model_group": model_group,
                     "text_type": text_type,
                     "scenario": scenario,
-                    "fold": fold,
+                    "eval_split": fold,
                     "class": label,
                     "precision": report[label]["precision"],
                     "recall": report[label]["recall"],
@@ -525,22 +486,20 @@ def evaluate_feature_set(
                         "model_group": model_group,
                         "text_type": text_type,
                         "scenario": scenario,
-                        "fold": fold,
+                        "eval_split": fold,
                         "actual": actual,
                         "predicted": predicted,
                         "count": int(cm[i, j]),
                     })
 
         # Regression on continuous realized volatility is evaluated independently.
-        reg = make_regressor()
-        reg.fit(X[train_idx], realized_vol[train_idx])
         volatility_pred = reg.predict(X[test_idx])
         fold_rows.append({
             "model": model_name,
             "model_group": model_group,
             "text_type": text_type,
             "scenario": scenario,
-            "fold": fold,
+            "eval_split": fold,
             "task": "regression_realized_volatility",
             "train_start": str(dates.iloc[train_idx].min().date()),
             "train_end": str(dates.iloc[train_idx].max().date()),
@@ -564,17 +523,19 @@ def summarize_results(fold_df: pd.DataFrame) -> pd.DataFrame:
         "accuracy", "balanced_accuracy", "macro_f1", "weighted_f1",
         "f1_low", "f1_medium", "f1_high", "mae", "rmse", "r2",
     ]
+    # Satu baris per (model, ..., eval_split). Nama kolom *_mean dipertahankan
+    # supaya kompatibel dengan skrip lama; dengan split tunggal 70/15/15 nilainya
+    # adalah skor pada eval_split tersebut (bukan rata-rata fold).
     rows: list[dict[str, Any]] = []
-    keys = ["model", "model_group", "text_type", "scenario", "task"]
+    keys = ["model", "model_group", "text_type", "scenario", "task", "eval_split"]
     for key_values, group in fold_df.groupby(keys, dropna=False):
         row = dict(zip(keys, key_values))
-        row["n_folds"] = int(len(group))
+        row["n_eval"] = int(group["n_test"].iloc[0])
         for metric in metric_columns:
             if metric in group.columns:
                 values = pd.to_numeric(group[metric], errors="coerce").dropna()
                 if len(values):
                     row[f"{metric}_mean"] = float(values.mean())
-                    row[f"{metric}_std"] = float(values.std(ddof=1)) if len(values) > 1 else 0.0
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -587,7 +548,7 @@ def build_domain_general_comparison(summary_df: pd.DataFrame) -> pd.DataFrame:
     if subset.empty:
         return pd.DataFrame()
 
-    grouped = subset.groupby(["text_type", "scenario", "model_group"], as_index=False).agg(
+    grouped = subset.groupby(["eval_split", "text_type", "scenario", "model_group"], as_index=False).agg(
         n_models=("model", "nunique"),
         macro_f1_mean=("macro_f1_mean", "mean"),
         macro_f1_between_model_std=("macro_f1_mean", "std"),
@@ -597,7 +558,7 @@ def build_domain_general_comparison(summary_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     pivot = grouped.pivot_table(
-        index=["text_type", "scenario"],
+        index=["eval_split", "text_type", "scenario"],
         columns="model_group",
         values="macro_f1_mean",
         aggfunc="first",
@@ -605,8 +566,8 @@ def build_domain_general_comparison(summary_df: pd.DataFrame) -> pd.DataFrame:
     if "domain_specific" in pivot.columns and "general_purpose" in pivot.columns:
         pivot["finbert_minus_general_macro_f1"] = pivot["domain_specific"] - pivot["general_purpose"]
     return grouped.merge(
-        pivot[[c for c in ["text_type", "scenario", "finbert_minus_general_macro_f1"] if c in pivot.columns]],
-        on=["text_type", "scenario"],
+        pivot[[c for c in ["eval_split", "text_type", "scenario", "finbert_minus_general_macro_f1"] if c in pivot.columns]],
+        on=["eval_split", "text_type", "scenario"],
         how="left",
     )
 
@@ -663,14 +624,13 @@ def main() -> None:
         y_all = targets["volatility_class"].astype(str).to_numpy()
         realized_vol_all = targets["realized_vol"].to_numpy(dtype=np.float64)
         dates_all = targets["date"].reset_index(drop=True)
-        n_splits = min(N_SPLITS, max(2, len(targets) - 1))
+        split_all = targets["split"].to_numpy()
         rows, class_rows, cm_rows = evaluate_feature_set(
-            market_matrix, y_all, realized_vol_all, dates_all,
+            market_matrix, y_all, realized_vol_all, dates_all, split_all,
             model_name="market_baseline",
             model_group="baseline",
             text_type="all",
             scenario="market_only",
-            n_splits=n_splits,
         )
         all_fold_rows.extend(rows)
         all_class_rows.extend(class_rows)
@@ -680,7 +640,7 @@ def main() -> None:
         log(f"\nLoading {model} / {text_type}: {path.name}")
         feature_df, metadata = load_feature_file(path)
 
-        merged = targets[["date", "volatility_class", "realized_vol"]].merge(
+        merged = targets[["date", "split", "volatility_class", "realized_vol"]].merge(
             feature_df,
             on="date",
             how="left",
@@ -713,7 +673,7 @@ def main() -> None:
         )
         diagnostic_rows.append(diagnostic)
         pca_projection_rows.append(pca_projection)
-        n_splits = min(N_SPLITS, max(2, len(merged) - 1))
+        split = merged["split"].to_numpy()
 
         scenarios = [("embedding_only", X_embedding)]
         if market_matrix is not None and market_matrix.shape[1] > 0:
@@ -723,12 +683,11 @@ def main() -> None:
         for scenario, X in scenarios:
             log(f"  Evaluating: {scenario}")
             rows, class_rows, cm_rows = evaluate_feature_set(
-                X, y, realized_vol, dates,
+                X, y, realized_vol, dates, split,
                 model_name=model,
                 model_group=MODEL_GROUPS[model],
                 text_type=text_type,
                 scenario=scenario,
-                n_splits=n_splits,
             )
             all_fold_rows.extend(rows)
             all_class_rows.extend(class_rows)
@@ -766,8 +725,9 @@ def main() -> None:
         "output_dir": str(OUTPUT_DIR),
         "n_target_rows": int(len(targets)),
         "target_class_distribution": {k: int(v) for k, v in targets["volatility_class"].value_counts().items()},
-        "n_splits": N_SPLITS,
-        "split_strategy": "TimeSeriesSplit (chronological; no random shuffle)",
+        "eval_splits": list(EVAL_SPLITS),
+        "split_strategy": "Official chronological 70/15/15 split from dataset_split.canonical_split (fit on train; report valid and test separately; select on valid only)",
+        "split_sizes": {k: int(v) for k, v in targets["split"].value_counts().items()},
         "classification_model": "StandardScaler + LogisticRegression(class_weight='balanced', L2)",
         "regression_model": "StandardScaler + Ridge on realized_vol",
         "logistic_C": LOGISTIC_C,
@@ -775,7 +735,7 @@ def main() -> None:
         "model_groups": MODEL_GROUPS,
         "market_lag_columns": available_market_cols,
         "feature_files": {f"{m}_{t}": str(p) for (m, t), p in feature_files.items()},
-        "target_definition": "realized_vol(t) = rolling standard deviation of the latest five BI business-day log returns, including t; volatility_class uses tertile thresholds fitted on earliest 70% of chronological observations.",
+        "target_definition": "realized_vol(t) = rolling standard deviation of the latest five BI business-day log returns, including t; volatility_class and day set taken from dataset_split.canonical_split (identical to Tugas 2).",
         "note": (
             "FinBERT is grouped as domain-specific; RoBERTa and Qwen as general-purpose. "
             "Group comparison is descriptive and does not isolate domain specialization "

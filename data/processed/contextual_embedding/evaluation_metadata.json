@@ -1,14 +1,22 @@
 {
-  "target_file": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/aligned_daily.csv",
-  "output_dir": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/contextual_embedding_volatility_evaluation",
-  "n_target_rows": 1197,
+  "target_file": "C:\\Users\\anabe\\SEM 5 (vscode)\\NLP\\nyimut-NLP26\\data\\processed\\aligned_daily.csv",
+  "output_dir": "C:\\Users\\anabe\\SEM 5 (vscode)\\NLP\\nyimut-NLP26\\data\\processed\\contextual_embedding",
+  "n_target_rows": 1104,
   "target_class_distribution": {
-    "low": 410,
-    "high": 402,
-    "medium": 385
+    "low": 380,
+    "high": 379,
+    "medium": 345
   },
-  "n_splits": 5,
-  "split_strategy": "TimeSeriesSplit (chronological; no random shuffle)",
+  "eval_splits": [
+    "valid",
+    "test"
+  ],
+  "split_strategy": "Official chronological 70/15/15 split from dataset_split.canonical_split (fit on train; report valid and test separately; select on valid only)",
+  "split_sizes": {
+    "train": 772,
+    "test": 167,
+    "valid": 165
+  },
   "classification_model": "StandardScaler + LogisticRegression(class_weight='balanced', L2)",
   "regression_model": "StandardScaler + Ridge on realized_vol",
   "logistic_C": 1.0,
@@ -25,13 +33,13 @@
     "lag1_realized_vol"
   ],
   "feature_files": {
-    "qwen_headline": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/head_vs_full/headline/qwen_headline_features.csv",
-    "finbert_headline": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/head_vs_full/headline/finbert_headline_features.csv",
-    "roberta_headline": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/head_vs_full/headline/roberta_headline_features.csv",
-    "roberta_fulltext": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/head_vs_full/fulltext/roberta_fulltext_features.csv",
-    "finbert_fulltext": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/head_vs_full/fulltext/finbert_fulltext_features.csv",
-    "qwen_fulltext": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/head_vs_full/fulltext/qwen_fulltext_features.csv"
+    "finbert_fulltext": "C:\\Users\\anabe\\SEM 5 (vscode)\\NLP\\nyimut-NLP26\\data\\processed\\head_vs_full\\fulltext\\finbert_fulltext_features.csv",
+    "qwen_fulltext": "C:\\Users\\anabe\\SEM 5 (vscode)\\NLP\\nyimut-NLP26\\data\\processed\\head_vs_full\\fulltext\\qwen_fulltext_features.csv",
+    "roberta_fulltext": "C:\\Users\\anabe\\SEM 5 (vscode)\\NLP\\nyimut-NLP26\\data\\processed\\head_vs_full\\fulltext\\roberta_fulltext_features.csv",
+    "finbert_headline": "C:\\Users\\anabe\\SEM 5 (vscode)\\NLP\\nyimut-NLP26\\data\\processed\\head_vs_full\\headline\\finbert_headline_features.csv",
+    "qwen_headline": "C:\\Users\\anabe\\SEM 5 (vscode)\\NLP\\nyimut-NLP26\\data\\processed\\head_vs_full\\headline\\qwen_headline_features.csv",
+    "roberta_headline": "C:\\Users\\anabe\\SEM 5 (vscode)\\NLP\\nyimut-NLP26\\data\\processed\\head_vs_full\\headline\\roberta_headline_features.csv"
   },
-  "target_definition": "realized_vol(t) = rolling standard deviation of the latest five BI business-day log returns, including t; volatility_class uses tertile thresholds fitted on earliest 70% of chronological observations.",
+  "target_definition": "realized_vol(t) = rolling standard deviation of the latest five BI business-day log returns, including t; volatility_class and day set taken from dataset_split.canonical_split (identical to Tugas 2).",
   "note": "FinBERT is grouped as domain-specific; RoBERTa and Qwen as general-purpose. Group comparison is descriptive and does not isolate domain specialization from architecture, model size, pretraining corpus, or embedding extraction choices. The low/medium/high volatility classes are retained."
 }

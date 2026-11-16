@@ -1,10 +1,15 @@
 
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from gensim.models import Word2Vec
+
+# split resmi 70/15/15 (sama dengan Tugas 2) -- lihat dataset_split.py
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from dataset_split import split_boundaries  # noqa: E402
 
 
 # ==================================================
@@ -12,11 +17,11 @@ from gensim.models import Word2Vec
 # ==================================================
 
 HEADLINE_CSV = Path(
-    "data/processed/cnbc_headline_daily.csv"
+    "data/processed/head_vs_full/headline/cnbc_headline_daily.csv"
 )
 
 OUTPUT_FEATURES = Path(
-    "data/processed/word2vec_headline_features.csv"
+    "data/processed/head_vs_full/headline/word2vec_headline_features.csv"
 )
 
 MODEL_PATH = Path(
@@ -31,7 +36,8 @@ WINDOW = 5
 MIN_COUNT = 2
 EPOCHS = 30
 
-TRAIN_RATIO = 0.80
+# Word2Vec hanya dilatih pada periode TRAIN resmi (s.d. tanggal terakhir train)
+TRAIN_END, _ = split_boundaries()
 SEED = 42
 WORKERS = 1
 
@@ -192,11 +198,11 @@ if total_headlines == 0:
 # ==================================================
 
 # Model hanya dilatih menggunakan headline dari
-# 80% tanggal paling awal.
+# periode TRAIN resmi (split 70/15/15). df sudah urut tanggal.
 
 split_idx = max(
     1,
-    int(len(df) * TRAIN_RATIO)
+    int((pd.to_datetime(df[DATE_COLUMN]) <= TRAIN_END).sum())
 )
 
 split_idx = min(

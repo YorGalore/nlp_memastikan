@@ -1,5 +1,6 @@
 
 from pathlib import Path
+import sys
 import warnings
 
 import numpy as np
@@ -35,7 +36,13 @@ ALIGNED_PATH = DATA_DIR / "aligned_daily.csv"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-TEST_SIZE = 0.20
+# Split resmi 70/15/15 (hari, label, dan batas tanggal sama dengan Tugas 2).
+# Model di-fit di TRAIN, lalu dievaluasi terpisah di VALID dan TEST.
+# Pemilihan representasi terbaik WAJIB memakai VALID; TEST hanya dilaporkan.
+sys.path.insert(0, str(ROOT_DIR / "src"))
+from dataset_split import canonical_split  # noqa: E402
+
+EVAL_SPLITS = ["valid", "test"]
 RANDOM_STATE = 42
 
 # Three-class volatility classification
@@ -97,86 +104,6 @@ def normalize_target(series):
 
     return result.astype("Int64")
 
-
-def ensure_volatility_target(aligned):
-    """Use report-defined volatility classes, deriving them only if needed.
-
-    Target definition:
-      1. realized_vol = standard deviation of the latest five BI business-day
-         log returns, including the current day.
-      2. The low/medium/high cutoffs are tertiles calibrated on the earliest
-         70% of chronological observations and then applied to the full series.
-
-    If volatility_class is already present, it is used as-is after normalization.
-    """
-
-    aligned = aligned.sort_values("date").reset_index(drop=True).copy()
-
-    if TARGET_COLUMN not in aligned.columns:
-        if "realized_vol" not in aligned.columns:
-            if "log_return" not in aligned.columns:
-                raise ValueError(
-                    "Kolom 'volatility_class' tidak ditemukan. Untuk membentuk "
-                    "target sesuai definisi laporan, aligned_daily.csv harus "
-                    "memiliki kolom 'realized_vol' atau 'log_return'."
-                )
-
-            log_returns = pd.to_numeric(
-                aligned["log_return"], errors="coerce"
-            )
-            aligned["realized_vol"] = log_returns.rolling(
-                window=5, min_periods=5
-            ).std()
-
-        realized_vol = pd.to_numeric(
-            aligned["realized_vol"], errors="coerce"
-        )
-        calibration_end = int(len(aligned) * 0.70)
-        calibration = realized_vol.iloc[:calibration_end].dropna()
-
-        if len(calibration) < 3:
-            raise ValueError(
-                "Observasi realized_vol pada 70% periode awal tidak cukup "
-                "untuk membentuk tiga kelas volatilitas."
-            )
-
-        try:
-            _, bin_edges = pd.qcut(
-                calibration,
-                q=3,
-                labels=CLASS_NAMES,
-                retbins=True,
-                duplicates="raise",
-            )
-        except ValueError as exc:
-            raise ValueError(
-                "Tertile volatility tidak dapat dibentuk menjadi tiga kelas "
-                "(kemungkinan banyak nilai realized_vol yang sama). "
-                "Periksa distribusi realized_vol."
-            ) from exc
-
-        if len(bin_edges) != 4 or not bin_edges[1] < bin_edges[2]:
-            raise ValueError(
-                "Threshold low/medium/high tidak menghasilkan tiga kelas "
-                "yang berbeda. Periksa distribusi realized_vol."
-            )
-
-        aligned[TARGET_COLUMN] = pd.cut(
-            realized_vol,
-            bins=[-np.inf, bin_edges[1], bin_edges[2], np.inf],
-            labels=CLASS_NAMES,
-            include_lowest=True,
-        )
-
-        print("Volatility target derived from realized_vol.")
-        print(f"Calibration period: earliest {calibration_end} observations")
-        print(f"Low/Medium threshold : {bin_edges[1]:.10f}")
-        print(f"Medium/High threshold: {bin_edges[2]:.10f}")
-    else:
-        print("Using existing volatility_class column from aligned_daily.csv.")
-
-    aligned[TARGET_COLUMN] = normalize_target(aligned[TARGET_COLUMN])
-    return aligned
 
 
 # ============================================================
@@ -294,21 +221,10 @@ if not ALIGNED_PATH.exists():
         f"Target file tidak ditemukan: {ALIGNED_PATH}"
     )
 
-aligned = pd.read_csv(ALIGNED_PATH)
-
-if "date" not in aligned.columns:
-    raise ValueError("Kolom 'date' tidak ditemukan di aligned_daily.csv")
-
-aligned["date"] = pd.to_datetime(
-    aligned["date"],
-    errors="coerce",
-)
-aligned = aligned.dropna(subset=["date"]).copy()
-aligned = ensure_volatility_target(aligned)
-
-# Drop dates where the five-day realized-volatility target is not available.
-aligned = aligned.dropna(subset=[TARGET_COLUMN]).copy()
-aligned[TARGET_COLUMN] = aligned[TARGET_COLUMN].astype(int)
+# Hari, label volatility_class, dan kolom split diambil dari split resmi
+# (dataset_split.canonical_split) -- identik dengan train_combined.py.
+aligned = canonical_split()[["date", "split", TARGET_COLUMN]].copy()
+aligned[TARGET_COLUMN] = normalize_target(aligned[TARGET_COLUMN]).astype(int)
 aligned = aligned.sort_values("date").reset_index(drop=True)
 
 if aligned["date"].duplicated().any():
@@ -331,37 +247,19 @@ print(
 
 
 # ============================================================
-# 6. CHRONOLOGICAL TRAIN-TEST SPLIT
+# 6. CHRONOLOGICAL TRAIN / VALID / TEST SPLIT (70/15/15)
 # ============================================================
 
-split_index = int(
-    len(aligned) * (1 - TEST_SIZE)
-)
-
-train_dates = aligned.iloc[
-    :split_index
-]["date"]
-
-test_dates = aligned.iloc[
-    split_index:
-]["date"]
-
 print("\n" + "=" * 65)
-print("CHRONOLOGICAL TRAIN-TEST SPLIT")
+print("CHRONOLOGICAL TRAIN / VALID / TEST SPLIT (70/15/15)")
 print("=" * 65)
 
-print(f"Train observations: {len(train_dates)}")
-print(f"Test observations : {len(test_dates)}")
-
-print(
-    f"Train period: {train_dates.min().date()} "
-    f"to {train_dates.max().date()}"
-)
-
-print(
-    f"Test period : {test_dates.min().date()} "
-    f"to {test_dates.max().date()}"
-)
+for split_name in ["train"] + EVAL_SPLITS:
+    split_dates = aligned.loc[aligned["split"] == split_name, "date"]
+    print(
+        f"{split_name:5s}: {len(split_dates):4d} hari "
+        f"({split_dates.min().date()} to {split_dates.max().date()})"
+    )
 
 
 # ============================================================
@@ -425,7 +323,7 @@ for experiment_name, filename in EXPERIMENTS.items():
     # --------------------------------------------------------
 
     dataset = aligned[
-        ["date", TARGET_COLUMN]
+        ["date", "split", TARGET_COLUMN]
     ].merge(
         features[["date"] + feature_columns],
         on="date",
@@ -454,23 +352,18 @@ for experiment_name, filename in EXPERIMENTS.items():
     # CHRONOLOGICAL SPLIT
     # --------------------------------------------------------
 
-    train_data = dataset[
-        dataset["date"].isin(train_dates)
-    ].copy()
+    train_data = dataset[dataset["split"] == "train"].copy()
+    eval_data = {
+        name: dataset[dataset["split"] == name].copy()
+        for name in EVAL_SPLITS
+    }
 
-    test_data = dataset[
-        dataset["date"].isin(test_dates)
-    ].copy()
-
-    if len(train_data) == 0 or len(test_data) == 0:
-        print("[SKIPPED] Data train/test kosong.")
+    if len(train_data) == 0 or any(len(d) == 0 for d in eval_data.values()):
+        print("[SKIPPED] Data train/valid/test kosong.")
         continue
 
     X_train = train_data[feature_columns]
     y_train = train_data[TARGET_COLUMN]
-
-    X_test = test_data[feature_columns]
-    y_test = test_data[TARGET_COLUMN]
 
     if set(CLASS_LABELS) - set(y_train.unique()):
         print(
@@ -479,16 +372,17 @@ for experiment_name, filename in EXPERIMENTS.items():
         )
         continue
 
-    if set(CLASS_LABELS) - set(y_test.unique()):
+    if any(set(CLASS_LABELS) - set(d[TARGET_COLUMN].unique()) for d in eval_data.values()):
         print(
-            "[SKIPPED] Testing tidak memiliki seluruh "
+            "[SKIPPED] Valid/test tidak memiliki seluruh "
             "tiga kelas target; multiclass AUC tidak dapat "
             "dibandingkan secara konsisten."
         )
         continue
 
     print(f"Train samples: {len(X_train)}")
-    print(f"Test samples : {len(X_test)}")
+    for name, d in eval_data.items():
+        print(f"{name.capitalize():5s} samples: {len(d)}")
     print(
         f"Dates with all-zero embeddings: "
         f"{missing_embedding_dates}"
@@ -524,74 +418,67 @@ for experiment_name, filename in EXPERIMENTS.items():
         y_train,
     )
 
-    # --------------------------------------------------------
-    # PREDICTION
-    # --------------------------------------------------------
-
-    y_pred = model.predict(X_test)
-
-    y_prob = model.predict_proba(X_test)
-
     classifier = model.named_steps["classifier"]
 
     # Ensure probability columns follow class order [0, 1, 2]
     class_order = list(classifier.classes_)
 
-    y_prob = y_prob[
-        :,
-        [class_order.index(label) for label in CLASS_LABELS]
-    ]
-
     # --------------------------------------------------------
-    # EVALUATION
+    # PREDICTION + EVALUATION (VALID dan TEST terpisah)
     # --------------------------------------------------------
 
-    metrics = calculate_metrics(
-        y_test,
-        y_pred,
-        y_prob,
-    )
+    for eval_split, eval_df in eval_data.items():
 
-    result = {
-        "experiment": experiment_name,
-        "model": experiment_name.rsplit("_", 1)[0],
-        "text_type": experiment_name.rsplit("_", 1)[1],
-        "n_features": len(feature_columns),
-        "train_samples": len(X_train),
-        "test_samples": len(X_test),
-        "low_test": int((y_test == 0).sum()),
-        "medium_test": int((y_test == 1).sum()),
-        "high_test": int((y_test == 2).sum()),
-        "zero_embedding_dates": int(missing_embedding_dates),
-        **metrics,
-    }
+        X_eval = eval_df[feature_columns]
+        y_test = eval_df[TARGET_COLUMN]
 
-    all_results.append(result)
+        y_pred = model.predict(X_eval)
 
-    # --------------------------------------------------------
-    # SAVE TEST PREDICTIONS
-    # --------------------------------------------------------
+        y_prob = model.predict_proba(X_eval)[
+            :,
+            [class_order.index(label) for label in CLASS_LABELS]
+        ]
 
-    predictions = pd.DataFrame({
-        "date": test_data["date"].values,
-        "experiment": experiment_name,
-        "y_true": y_test.values,
-        "y_pred": y_pred,
-        "prob_low": y_prob[:, 0],
-        "prob_medium": y_prob[:, 1],
-        "prob_high": y_prob[:, 2],
-    })
+        metrics = calculate_metrics(
+            y_test,
+            y_pred,
+            y_prob,
+        )
 
-    all_predictions.append(predictions)
+        result = {
+            "experiment": experiment_name,
+            "model": experiment_name.rsplit("_", 1)[0],
+            "text_type": experiment_name.rsplit("_", 1)[1],
+            "eval_split": eval_split,
+            "n_features": len(feature_columns),
+            "train_samples": len(X_train),
+            "eval_samples": len(X_eval),
+            "low_eval": int((y_test == 0).sum()),
+            "medium_eval": int((y_test == 1).sum()),
+            "high_eval": int((y_test == 2).sum()),
+            "zero_embedding_dates": int(missing_embedding_dates),
+            **metrics,
+        }
 
-    # --------------------------------------------------------
-    # PRINT METRICS
-    # --------------------------------------------------------
+        all_results.append(result)
 
-    print("\nEvaluation results:")
+        predictions = pd.DataFrame({
+            "date": eval_df["date"].values,
+            "experiment": experiment_name,
+            "eval_split": eval_split,
+            "y_true": y_test.values,
+            "y_pred": y_pred,
+            "prob_low": y_prob[:, 0],
+            "prob_medium": y_prob[:, 1],
+            "prob_high": y_prob[:, 2],
+        })
 
-    for metric, value in metrics.items():
-        print(f"{metric:18s}: {value:.4f}")
+        all_predictions.append(predictions)
+
+        print(f"\nEvaluation results ({eval_split}):")
+
+        for metric, value in metrics.items():
+            print(f"{metric:18s}: {value:.4f}")
 
 
 # ============================================================
@@ -624,6 +511,7 @@ if all_predictions:
         ignore_index=True,
     )
 
+    # berisi prediksi VALID dan TEST (lihat kolom eval_split)
     predictions_path = (
         OUTPUT_DIR / "test_predictions.csv"
     )
@@ -666,6 +554,7 @@ print(
     results_df[
         [
             "experiment",
+            "eval_split",
             "roc_auc",
             "pr_auc",
             "accuracy",

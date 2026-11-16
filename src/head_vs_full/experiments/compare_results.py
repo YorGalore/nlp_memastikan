@@ -55,8 +55,13 @@ print("=" * 70)
 # SORT RESULTS
 # ============================================================
 
+# Hasil dihitung terpisah untuk VALID dan TEST (split 70/15/15).
+# Pemilihan headline vs full text sebaiknya berdasarkan baris eval_split=valid.
+if "eval_split" not in results.columns:
+    results["eval_split"] = "test"
+
 results = results.sort_values(
-    by=["model", "text_type"]
+    by=["eval_split", "model", "text_type"]
 ).reset_index(drop=True)
 
 
@@ -65,7 +70,7 @@ results = results.sort_values(
 # ============================================================
 
 comparison = results.pivot(
-    index="model",
+    index=["eval_split", "model"],
     columns="text_type",
     values=METRICS,
 )
@@ -144,7 +149,7 @@ comparison.to_csv(
 
 summary = (
     results
-    .groupby("text_type")[METRICS]
+    .groupby(["eval_split", "text_type"])[METRICS]
     .mean()
     .reset_index()
 )
@@ -165,6 +170,7 @@ print("\n1. INDIVIDUAL MODEL COMPARISON")
 print("-" * 70)
 
 display_columns = [
+    "eval_split",
     "model",
     "roc_auc_headline",
     "roc_auc_fulltext",
@@ -200,7 +206,7 @@ print("\n3. ROC-AUC WINNER COUNT")
 print("-" * 70)
 
 print(
-    comparison["roc_auc_winner"].value_counts().to_string()
+    comparison.groupby("eval_split")["roc_auc_winner"].value_counts().to_string()
 )
 
 

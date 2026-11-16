@@ -1,10 +1,15 @@
 
 import logging
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from gensim.models.doc2vec import Doc2Vec, TaggedDocument
+
+# split resmi 70/15/15 (sama dengan Tugas 2) -- lihat dataset_split.py
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from dataset_split import split_boundaries  # noqa: E402
 
 
 # ==================================================
@@ -13,7 +18,7 @@ from gensim.models.doc2vec import Doc2Vec, TaggedDocument
 
 INPUT_CSV = "data/processed/aligned_daily.csv"
 
-OUTPUT_FEATURES = "data/processed/doc2vec_fulltext_features.csv"
+OUTPUT_FEATURES = "data/processed/head_vs_full/fulltext/doc2vec_fulltext_features.csv"
 
 MODEL_PATH = "models/doc2vec_fulltext.model"
 
@@ -26,7 +31,8 @@ EPOCHS = 20
 INFER_EPOCHS = 30
 
 SEED = 42
-TRAIN_RATIO = 0.80
+# Doc2Vec hanya dilatih pada periode TRAIN resmi (s.d. tanggal terakhir train)
+TRAIN_END, _ = split_boundaries()
 WORKERS = 4
 
 
@@ -102,10 +108,10 @@ if len(tokenized_docs) > 1:
 # 5. TEMPORAL TRAIN-TEST SPLIT
 # ==================================================
 
-# Menggunakan 80% tanggal paling awal
-# untuk training Doc2Vec.
+# Menggunakan tanggal periode TRAIN resmi (split 70/15/15)
+# untuk training Doc2Vec. df sudah urut tanggal.
 
-split_idx = int(len(df) * TRAIN_RATIO)
+split_idx = int((pd.to_datetime(df["date"]) <= TRAIN_END).sum())
 
 if split_idx == 0 or split_idx >= len(df):
     raise ValueError("Pembagian data training tidak valid.")

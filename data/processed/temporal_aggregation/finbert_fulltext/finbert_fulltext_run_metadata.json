@@ -26,7 +26,8 @@
     5,
     7
   ],
-  "attention_train_ratio": 0.8,
+  "attention_train_split": "official 70/15/15 train days (dataset_split.canonical_split)",
+  "attention_train_days": 772,
   "target_column": "volatility_class",
   "target_classes": [
     "low",

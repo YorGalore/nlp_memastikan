@@ -1,11 +1,11 @@
 {
-  "target_file": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/aligned_daily.csv",
+  "target_file": "C:\\Users\\anabe\\SEM 5 (vscode)\\NLP\\nyimut-NLP26\\data\\processed\\aligned_daily.csv",
   "target": "volatility_class (low/medium/high)",
-  "target_definition": "5-BI-business-day rolling standard deviation of log_return; tertile thresholds fitted on earliest 70% chronological observations, consistent with project target.",
+  "target_definition": "5-BI-business-day rolling standard deviation of log_return; volatility_class and day set taken from dataset_split.canonical_split (identical to Tugas 2).",
   "topic_model": "lda",
-  "topic_file": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/topic_modelling/lda/daily_topic_features.csv",
-  "ner_file": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/ner/daily_entity_features.csv",
-  "embedding_dir": "/Users/aliyajumarna/Developer/nyimut-NLP26/data/processed/head_vs_full",
+  "topic_file": "C:\\Users\\anabe\\SEM 5 (vscode)\\NLP\\nyimut-NLP26\\data\\processed\\topic_modelling\\lda\\daily_topic_features.csv",
+  "ner_file": "C:\\Users\\anabe\\SEM 5 (vscode)\\NLP\\nyimut-NLP26\\data\\processed\\ner\\daily_entity_features.csv",
+  "embedding_dir": "C:\\Users\\anabe\\SEM 5 (vscode)\\NLP\\nyimut-NLP26\\data\\processed\\head_vs_full",
   "experiments": {
     "E1_embedding_only": [
       "embedding"
@@ -33,14 +33,22 @@
     "headline",
     "fulltext"
   ],
-  "n_splits": 5,
-  "split_strategy": "TimeSeriesSplit (chronological, no shuffle)",
+  "eval_splits": [
+    "valid",
+    "test"
+  ],
+  "split_strategy": "Official chronological 70/15/15 split from dataset_split.canonical_split (fit on train; report valid and test separately; select on valid only)",
+  "split_sizes": {
+    "train": 772,
+    "test": 167,
+    "valid": 165
+  },
   "classifier": "SimpleImputer(0) + StandardScaler + LogisticRegression(class_weight=balanced, L2)",
-  "n_target_rows": 1197,
+  "n_target_rows": 1104,
   "class_distribution": {
-    "low": 410,
-    "high": 402,
-    "medium": 385
+    "low": 380,
+    "high": 379,
+    "medium": 345
   },
   "skipped_embedding_files": [],
   "caveat": "Topic models were generated before this supervised evaluation. If topic models were fitted on the full time span, topic feature extraction is transductive; for strict forecasting claims, refit topic models inside each chronological training fold."
