@@ -26,7 +26,9 @@
     5,
     7
   ],
-  "attention_train_ratio": 0.8,
+  "attention_train_dates": 772,
+  "attention_train_start": "2021-09-16",
+  "attention_train_end": "2025-03-25",
   "target_column": "volatility_class",
   "target_classes": [
     "low",

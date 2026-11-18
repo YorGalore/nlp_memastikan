@@ -8,6 +8,7 @@ predictive value beyond information available from JISDOR before day t.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -19,78 +20,29 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
+SRC_DIR = Path(__file__).resolve().parents[1]
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from dataset_split import PRICE_FEATURES, TRAIN_FRAC, VALID_FRAC, build_dataset
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 DATA_DIR = ROOT_DIR / "data" / "processed"
-ALIGNED_FILE = DATA_DIR / "aligned_daily.csv"
 TOPIC_DIR = DATA_DIR / "topic_modelling"
 OUTPUT_DIR = TOPIC_DIR / "predictive_evaluation"
 TOPIC_MODELS = ("bertopic", "lda", "dtm", "top2vec")
 CLASS_ORDER = ("low", "medium", "high")
-TRAIN_FRAC = 0.70
-VALID_FRAC = 0.15
 RANDOM_STATE = 42
 
 # Each predictor is known strictly before day t.  They deliberately exclude
 # kurs(t), log_return(t), and realized_vol(t), which contain target-day data.
-JISDOR_FEATURES = [
-    "jisdor_lag1_log_return", "jisdor_lag2_log_return",
-    "jisdor_lag3_log_return", "jisdor_lag4_log_return",
-    "jisdor_known4_mean", "jisdor_known4_std",
-    "jisdor_vol_if_r0", "jisdor_vol_if_rtyp_pos",
-    "jisdor_vol_if_rtyp_neg", "jisdor_lag1_volatility_class",
-]
+JISDOR_FEATURES = PRICE_FEATURES
 
 
 def load_targets() -> pd.DataFrame:
-    if not ALIGNED_FILE.exists():
-        raise FileNotFoundError(f"JISDOR-aligned data tidak ditemukan: {ALIGNED_FILE}")
-    target = pd.read_csv(ALIGNED_FILE)
-    required = {"date", "log_return"}
-    missing = required - set(target.columns)
-    if missing:
-        raise ValueError(f"aligned_daily.csv tidak memiliki kolom: {sorted(missing)}")
-
-    target["date"] = pd.to_datetime(target["date"], errors="coerce").dt.normalize()
-    target["log_return"] = pd.to_numeric(target["log_return"], errors="coerce")
-    target = target.dropna(subset=["date"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
-    if "realized_vol" not in target.columns:
-        target["realized_vol"] = target["log_return"].rolling(5, min_periods=5).std()
-    target["realized_vol"] = pd.to_numeric(target["realized_vol"], errors="coerce")
-
-    labels = pd.Series(np.nan, index=target.index, dtype="object")
-    if "volatility_class" in target.columns:
-        labels = target["volatility_class"].astype("string").str.lower().str.strip()
-        labels = labels.where(labels.isin(CLASS_ORDER), np.nan)
-    if labels.isna().any():
-        calibration = target.loc[target["realized_vol"].notna(), "realized_vol"]
-        calibration = calibration.iloc[:max(3, int(len(calibration) * 0.70))]
-        low, high = calibration.quantile([1 / 3, 2 / 3]).to_numpy()
-        labels = pd.cut(target["realized_vol"], [-np.inf, low, high, np.inf], labels=CLASS_ORDER).astype("object")
-    target["volatility_class"] = labels
-    target = target.dropna(subset=["realized_vol", "volatility_class"]).reset_index(drop=True)
-    return add_jisdor_features(target)
-
-
-def add_jisdor_features(target: pd.DataFrame) -> pd.DataFrame:
-    result = target.copy()
-    returns = result["log_return"]
-    known = pd.concat([returns.shift(lag) for lag in (1, 2, 3, 4)], axis=1)
-    for lag in (1, 2, 3, 4):
-        result[f"jisdor_lag{lag}_log_return"] = returns.shift(lag)
-    result["jisdor_known4_mean"] = known.mean(axis=1, skipna=False)
-    result["jisdor_known4_std"] = known.std(axis=1, skipna=False)
-
-    def volatility_if(return_at_t: np.ndarray) -> np.ndarray:
-        return np.std(np.column_stack([known.to_numpy(), return_at_t]), axis=1, ddof=1)
-
-    typical = returns.abs().expanding().median().shift(1).to_numpy()
-    result["jisdor_vol_if_r0"] = volatility_if(np.zeros(len(result)))
-    result["jisdor_vol_if_rtyp_pos"] = volatility_if(typical)
-    result["jisdor_vol_if_rtyp_neg"] = volatility_if(-typical)
-    class_to_index = {label: index for index, label in enumerate(CLASS_ORDER)}
-    result["jisdor_lag1_volatility_class"] = result["volatility_class"].map(class_to_index).shift(1)
-    return result
+    """Load the central leak-free target and canonical 70/15/15 split."""
+    train, valid, test = build_dataset(required_cols=JISDOR_FEATURES)
+    return pd.concat([train, valid, test], ignore_index=True)
 
 
 def load_topic_features(model_name: str) -> pd.DataFrame:

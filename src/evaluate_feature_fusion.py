@@ -25,6 +25,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
+from dataset_split import PRICE_FEATURES, TRAIN_FRAC, VALID_FRAC, build_dataset
 
 # ============================================================
 # CONFIGURATION
@@ -33,15 +34,12 @@ from xgboost import XGBClassifier
 MODELS = ("finbert", "roberta", "qwen")
 TEXT_TYPES = ("headline", "fulltext")
 CLASS_ORDER = ("low", "medium", "high")
-TRAIN_FRAC = 0.70
-VALID_FRAC = 0.15
 RANDOM_STATE = 42
 LOGISTIC_C = 1.0
-JISDOR_FEATURES = [
-    "jisdor_lag1_log_return", "jisdor_lag2_log_return", "jisdor_lag3_log_return", "jisdor_lag4_log_return",
-    "jisdor_known4_mean", "jisdor_known4_std", "jisdor_vol_if_r0", "jisdor_vol_if_rtyp_pos",
-    "jisdor_vol_if_rtyp_neg", "jisdor_lag1_volatility_class",
-]
+# Reuse the canonical market features and chronological split from
+# dataset_split.py. Every experiment must use the same target days, labels,
+# cutoffs, and 70/15/15 boundaries.
+JISDOR_FEATURES = PRICE_FEATURES
 
 # LDA is the default because the project's topic evaluation showed full
 # document coverage. Change to bertopic/dtm/top2vec if that is the chosen model.
@@ -123,71 +121,12 @@ def parse_vector(value: Any) -> list[float] | None:
 
 
 def load_targets() -> pd.DataFrame:
-    """Load report-aligned target; derive classes only if they are unavailable."""
-    if not TARGET_FILE.exists():
-        raise FileNotFoundError(f"Target file tidak ditemukan: {TARGET_FILE}")
-
-    target = pd.read_csv(TARGET_FILE)
-    required = {"date", "log_return"}
-    missing = required - set(target.columns)
-    if missing:
-        raise ValueError(f"Kolom wajib tidak ada di aligned_daily.csv: {sorted(missing)}")
-
-    target["date"] = pd.to_datetime(target["date"], errors="coerce").dt.normalize()
-    target["log_return"] = pd.to_numeric(target["log_return"], errors="coerce")
-    target = target.dropna(subset=["date"]).sort_values("date")
-    target = target.drop_duplicates("date", keep="last").reset_index(drop=True)
-
-    if "realized_vol" in target.columns:
-        target["realized_vol"] = pd.to_numeric(target["realized_vol"], errors="coerce")
-    else:
-        target["realized_vol"] = target["log_return"].rolling(5, min_periods=5).std()
-
-    if "volatility_class" in target.columns:
-        labels = target["volatility_class"].astype(str).str.strip().str.lower()
-        labels = labels.where(labels.isin(CLASS_ORDER), np.nan)
-    else:
-        labels = pd.Series(np.nan, index=target.index, dtype="object")
-
-    # Recreate the project rule if labels are absent or incomplete:
-    # tertile cutoffs fitted on the earliest 70% of valid chronological rows.
-    if labels.isna().any():
-        valid_vol = target["realized_vol"].notna()
-        values = target.loc[valid_vol, "realized_vol"]
-        if len(values) < 3:
-            raise ValueError("Tidak cukup data realized_vol untuk membentuk tiga kelas.")
-        calibration_n = max(3, int(np.floor(len(values) * 0.70)))
-        q_low, q_high = values.iloc[:calibration_n].quantile([1 / 3, 2 / 3]).to_numpy()
-        if not np.isfinite(q_low) or not np.isfinite(q_high) or q_low >= q_high:
-            raise ValueError("Threshold tertile realized_vol tidak valid.")
-        labels = pd.cut(
-            target["realized_vol"],
-            bins=[-np.inf, q_low, q_high, np.inf],
-            labels=CLASS_ORDER,
-            include_lowest=True,
-        ).astype("object")
-
-    target["volatility_class"] = labels
-    target = target.dropna(subset=["realized_vol", "volatility_class"])
-    target = target[target["volatility_class"].isin(CLASS_ORDER)].copy()
+    """Load the canonical, leak-free 70/15/15 dataset used by other models."""
+    train, valid, test = build_dataset(required_cols=JISDOR_FEATURES)
+    target = pd.concat([train, valid, test], ignore_index=True)
+    target["date"] = pd.to_datetime(target["date"]).dt.normalize()
     target["volatility_class"] = target["volatility_class"].astype(str)
-    # Predictors from JISDOR are lagged so they contain no target-day market data.
-    returns = target["log_return"]
-    known = pd.concat([returns.shift(lag) for lag in (1, 2, 3, 4)], axis=1)
-    for lag in (1, 2, 3, 4):
-        target[f"jisdor_lag{lag}_log_return"] = returns.shift(lag)
-    target["jisdor_known4_mean"] = known.mean(axis=1, skipna=False)
-    target["jisdor_known4_std"] = known.std(axis=1, skipna=False)
-    def volatility_if(value: np.ndarray) -> np.ndarray:
-        return np.std(np.column_stack([known.to_numpy(), value]), axis=1, ddof=1)
-    typical = returns.abs().expanding().median().shift(1).to_numpy()
-    target["jisdor_vol_if_r0"] = volatility_if(np.zeros(len(target)))
-    target["jisdor_vol_if_rtyp_pos"] = volatility_if(typical)
-    target["jisdor_vol_if_rtyp_neg"] = volatility_if(-typical)
-    target["jisdor_lag1_volatility_class"] = target["volatility_class"].map(
-        {label: index for index, label in enumerate(CLASS_ORDER)}
-    ).shift(1)
-    return target[["date", "volatility_class", "realized_vol", *JISDOR_FEATURES]].reset_index(drop=True)
+    return target[["date", "volatility_class", "realized_vol", *JISDOR_FEATURES]]
 
 
 def normalize_date(df: pd.DataFrame, path: Path) -> tuple[pd.DataFrame, str]:

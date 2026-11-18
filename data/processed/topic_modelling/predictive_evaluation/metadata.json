@@ -1,15 +1,15 @@
 {
   "jisdor_features": [
-    "jisdor_lag1_log_return",
-    "jisdor_lag2_log_return",
-    "jisdor_lag3_log_return",
-    "jisdor_lag4_log_return",
-    "jisdor_known4_mean",
-    "jisdor_known4_std",
-    "jisdor_vol_if_r0",
-    "jisdor_vol_if_rtyp_pos",
-    "jisdor_vol_if_rtyp_neg",
-    "jisdor_lag1_volatility_class"
+    "lag1_log_return",
+    "lag2_log_return",
+    "lag3_log_return",
+    "lag4_log_return",
+    "known4_mean",
+    "known4_std",
+    "vol_if_r0",
+    "vol_if_rtyp_pos",
+    "vol_if_rtyp_neg",
+    "lag1_volatility_class_enc"
   ],
   "classifiers": [
     "logistic_regression",

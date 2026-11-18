@@ -1,10 +1,17 @@
 from pathlib import Path
 import json
 import re
+import sys
 import warnings
 
 import numpy as np
 import pandas as pd
+
+SRC_DIR = Path(__file__).resolve().parents[1]
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from dataset_split import PRICE_FEATURES, build_dataset
 
 # ----------------------------- CONFIGURATION -----------------------------
 
@@ -42,8 +49,6 @@ MODEL_OUTPUT_DIR = ROOT / "models/temporal_aggregation"
 ROLLING_WINDOWS = [3, 5, 7, 14, 30]
 EXPONENTIAL_HALF_LIVES = [1, 3, 5, 7]
 
-# Chronological split for the supervised attention module.
-ATTENTION_TRAIN_RATIO = 0.80
 ATTENTION_EPOCHS = 100
 ATTENTION_LEARNING_RATE = 1e-3
 ATTENTION_WEIGHT_DECAY = 1e-4
@@ -368,13 +373,14 @@ def event_aware_features(article_df, emb_cols, calendar):
 
 # -------------------------- A3 ATTENTION ----------------------------------
 
-def attention_pooling(article_df, emb_cols, calendar, target_df, model_name):
+def attention_pooling(article_df, emb_cols, calendar, target_df, train_dates, model_name):
     """
     Supervised single-query attention pooling.
 
     The attention scorer and classifier are fitted ONLY on the chronological
-    training segment. The learned scorer is then applied to articles on every
-    date. The held-out tail is never used to fit attention parameters.
+    training segment from dataset_split.py. The learned scorer is then applied
+    to articles on every date. Validation and test dates are never used to fit
+    attention parameters.
 
     For a strict downstream CV study, move this fitting procedure inside each
     outer temporal fold. This standalone script uses one chronological holdout.
@@ -394,6 +400,9 @@ def attention_pooling(article_df, emb_cols, calendar, target_df, model_name):
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
+        # Multi-threaded CPU autograd crashes in the project environment.
+        # The attention model is small, so a single worker is a safe fallback.
+        torch.set_num_threads(1)
 
     log(f"A3 {model_name}: using device = {device}")
 
@@ -409,13 +418,14 @@ def attention_pooling(article_df, emb_cols, calendar, target_df, model_name):
     y_map = target_df.set_index("date")[TARGET_COLUMN].to_dict()
     class_to_idx = {label: i for i, label in enumerate(TARGET_CLASSES)}
 
-    train_n = max(1, int(len(dates) * ATTENTION_TRAIN_RATIO))
-    train_dates = dates[:train_n]
+    train_dates = set(pd.DatetimeIndex(list(train_dates)).normalize())
 
     train_x = []
     train_y = []
     train_date_list = []
-    for date in train_dates:
+    for date in dates:
+        if date not in train_dates:
+            continue
         arr = date_to_articles.get(date)
         label = y_map.get(date)
         if arr is None or len(arr) == 0 or pd.isna(label) or label not in class_to_idx:
@@ -518,7 +528,7 @@ def attention_pooling(article_df, emb_cols, calendar, target_df, model_name):
 
 # ------------------------------- MAIN -------------------------------------
 
-def run_for_model(model_name, embedding_path, calendar, event_meta):
+def run_for_model(model_name, embedding_path, calendar, target_df, train_dates, event_meta):
     log(f"Processing model: {model_name}")
     articles, emb_cols = load_article_embeddings(embedding_path, event_meta)
 
@@ -548,8 +558,7 @@ def run_for_model(model_name, embedding_path, calendar, event_meta):
         save_features(a2, model_dir / f"{model_name}_A2_exp_decay_hl{half_life}d.csv")
 
     # A3: learned attention over individual articles per date
-    target_df = calendar[["date", TARGET_COLUMN]].copy()
-    a3 = attention_pooling(articles, emb_cols, calendar, target_df, model_name)
+    a3 = attention_pooling(articles, emb_cols, calendar, target_df, train_dates, model_name)
     save_features(a3, model_dir / f"{model_name}_A3_attention.csv")
 
     # A4: event-aware mean vectors and event counts
@@ -567,7 +576,9 @@ def run_for_model(model_name, embedding_path, calendar, event_meta):
         "event_categories": EVENT_CATEGORIES,
         "rolling_windows_days": ROLLING_WINDOWS,
         "exponential_half_lives_days": EXPONENTIAL_HALF_LIVES,
-        "attention_train_ratio": ATTENTION_TRAIN_RATIO,
+        "attention_train_dates": int(len(train_dates)),
+        "attention_train_start": str(min(train_dates).date()),
+        "attention_train_end": str(max(train_dates).date()),
         "target_column": TARGET_COLUMN,
         "target_classes": TARGET_CLASSES,
     }
@@ -580,6 +591,10 @@ def run_for_model(model_name, embedding_path, calendar, event_meta):
 def main():
     ensure_dirs()
     calendar = load_daily_calendar()
+    train, valid, test = build_dataset(required_cols=PRICE_FEATURES)
+    targets = pd.concat([train, valid, test], ignore_index=True)[["date", TARGET_COLUMN]]
+    targets["date"] = pd.to_datetime(targets["date"]).dt.normalize()
+    train_dates = set(pd.to_datetime(train["date"]).dt.normalize())
     event_meta = load_event_metadata()
 
     log(f"Calendar: {len(calendar):,} dates")
@@ -588,7 +603,7 @@ def main():
     failures = []
     for model_name, path in EMBEDDING_FILES.items():
         try:
-            run_for_model(model_name, path, calendar, event_meta)
+            run_for_model(model_name, path, calendar, targets, train_dates, event_meta)
         except Exception as exc:
             failures.append((model_name, repr(exc)))
             log(f"FAILED {model_name}: {exc}")

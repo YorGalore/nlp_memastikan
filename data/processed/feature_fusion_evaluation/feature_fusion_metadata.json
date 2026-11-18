@@ -74,22 +74,22 @@
     "SimpleImputer + XGBoost multiclass"
   ],
   "jisdor_feature_columns": [
-    "jisdor_lag1_log_return",
-    "jisdor_lag2_log_return",
-    "jisdor_lag3_log_return",
-    "jisdor_lag4_log_return",
-    "jisdor_known4_mean",
-    "jisdor_known4_std",
-    "jisdor_vol_if_r0",
-    "jisdor_vol_if_rtyp_pos",
-    "jisdor_vol_if_rtyp_neg",
-    "jisdor_lag1_volatility_class"
+    "lag1_log_return",
+    "lag2_log_return",
+    "lag3_log_return",
+    "lag4_log_return",
+    "known4_mean",
+    "known4_std",
+    "vol_if_r0",
+    "vol_if_rtyp_pos",
+    "vol_if_rtyp_neg",
+    "lag1_volatility_class_enc"
   ],
-  "n_target_rows": 1197,
+  "n_target_rows": 1104,
   "class_distribution": {
-    "low": 410,
-    "high": 402,
-    "medium": 385
+    "low": 380,
+    "high": 379,
+    "medium": 345
   },
   "skipped_embedding_files": [],
   "caveat": "Topic models were generated before this supervised evaluation. If topic models were fitted on the full time span, topic feature extraction is transductive; for strict forecasting claims, fit topic models using only the 70% training period before transforming validation/test."
