@@ -2,16 +2,21 @@
 import pandas as pd
 import numpy as np
 import re
+import sys
 from pathlib import Path
 from gensim.models import Word2Vec
 
-# ==================================================ß
+# split resmi 70/15/15 (sama dengan Tugas 2) -- lihat dataset_split.py
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from dataset_split import split_boundaries  # noqa: E402
+
+# ==================================================
 # 1. KONFIGURASI
 # ==================================================
 
 INPUT_CSV = "data/processed/aligned_daily.csv"
 
-OUTPUT_FEATURES = "data/processed/word2vec_daily_features.csv"
+OUTPUT_FEATURES = "data/processed/head_vs_full/fulltext/word2vec_fulltext_features.csv"
 
 MODEL_PATH = "models/word2vec_model.model"
 
@@ -20,7 +25,8 @@ WINDOW = 5
 MIN_COUNT = 2
 EPOCHS = 30
 SEED = 42
-TRAIN_RATIO = 0.80
+# Word2Vec hanya dilatih pada periode TRAIN resmi (s.d. tanggal terakhir train)
+TRAIN_END, _ = split_boundaries()
 
 
 # ==================================================
@@ -80,7 +86,8 @@ print(tokenized_docs[1][:20])
 # agar informasi dari periode masa depan tidak masuk
 # ke proses pembentukan vocabulary dan embedding.
 
-split_idx = int(len(df) * TRAIN_RATIO)
+# tanggal periode TRAIN resmi (split 70/15/15); df sudah urut tanggal
+split_idx = int((df["date"] <= TRAIN_END).sum())
 
 train_sentences = tokenized_docs[:split_idx]
 
@@ -203,11 +210,11 @@ result = pd.concat(
 # Mengubah tanggal kembali menjadi format YYYY-MM-DD
 result["date"] = result["date"].dt.strftime("%Y-%m-%d")
 
-# Menyimpan dataset lengkap
-Path(OUTPUT_CSV).parent.mkdir(parents=True, exist_ok=True)
-result.to_csv(OUTPUT_CSV, index=False)
+# (Dulu dataset lengkap juga disimpan ke OUTPUT_CSV, tapi variabel itu tidak
+# pernah didefinisikan -> NameError. Tidak dipakai tahap mana pun, jadi dihapus.)
 
 # Menyimpan dataset fitur embedding saja
+Path(OUTPUT_FEATURES).parent.mkdir(parents=True, exist_ok=True)
 feature_result = pd.concat(
     [
         result[["date"]],
@@ -238,6 +245,5 @@ print("\nContoh embedding:")
 print(feature_result.head())
 
 print("\nFile berhasil disimpan:")
-print(OUTPUT_CSV)
 print(OUTPUT_FEATURES)
 print(MODEL_PATH)

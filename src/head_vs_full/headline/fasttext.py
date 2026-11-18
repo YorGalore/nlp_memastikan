@@ -1,10 +1,15 @@
 
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from gensim.models import FastText
+
+# split resmi 70/15/15 (sama dengan Tugas 2) -- lihat dataset_split.py
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from dataset_split import split_boundaries  # noqa: E402
 
 
 # ==================================================
@@ -12,11 +17,11 @@ from gensim.models import FastText
 # ==================================================
 
 HEADLINE_CSV = Path(
-    "data/processed/cnbc_headline_daily.csv"
+    "data/processed/head_vs_full/headline/cnbc_headline_daily.csv"
 )
 
 OUTPUT_FEATURES = Path(
-    "data/processed/fasttext_headline_features.csv"
+    "data/processed/head_vs_full/headline/fasttext_headline_features.csv"
 )
 
 MODEL_PATH = Path(
@@ -31,7 +36,8 @@ WINDOW = 5
 MIN_COUNT = 2
 EPOCHS = 10
 
-TRAIN_RATIO = 0.80
+# FastText hanya dilatih pada periode TRAIN resmi (s.d. tanggal terakhir train)
+TRAIN_END, _ = split_boundaries()
 SEED = 42
 WORKERS = 4
 
@@ -169,9 +175,10 @@ print(
 # 4. TEMPORAL TRAINING SPLIT
 # ==================================================
 
+# periode TRAIN resmi (split 70/15/15); news_df sudah urut tanggal
 split_idx = max(
     1,
-    int(len(news_df) * TRAIN_RATIO)
+    int((pd.to_datetime(news_df[DATE_COLUMN]) <= TRAIN_END).sum())
 )
 
 split_idx = min(

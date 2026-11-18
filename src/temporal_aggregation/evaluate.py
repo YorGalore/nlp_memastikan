@@ -17,6 +17,7 @@
 from pathlib import Path
 import json
 import random
+import sys
 import time
 import warnings
 
@@ -46,13 +47,18 @@ warnings.filterwarnings("ignore")
 
 ROOT = Path(__file__).resolve().parents[2]
 
+# Split resmi 70/15/15 (hari, label, batas tanggal sama dengan Tugas 2).
+sys.path.insert(0, str(ROOT / "src"))
+from dataset_split import canonical_split  # noqa: E402
+
 ALIGNED_DAILY_CSV = ROOT / "data/processed/aligned_daily.csv"
 
 TEMPORAL_AGG_DIR = ROOT / "data/processed/temporal_aggregation"
 
 # Separate output directory so cached direction-classification results
 # cannot be mistaken for volatility-classification results.
-OUTPUT_DIR = ROOT / "data/processed/temporal_evaluation_volatility_class"
+# folder yang sama dengan hasil yang di-commit (sebelumnya dipindah manual)
+OUTPUT_DIR = ROOT / "data/processed/temporal_aggregation/evaluation"
 
 RESULTS_DIR = OUTPUT_DIR / "results"
 
@@ -83,16 +89,12 @@ CLASS_TO_IDX = {
 
 
 # ------------------------------------------------------------
-# Walk-forward CV
+# Split resmi 70/15/15 (menggantikan walk-forward CV)
 # ------------------------------------------------------------
+# Classifier di-fit di TRAIN (early stopping memakai 15% ekor TRAIN),
+# lalu dievaluasi terpisah di VALID dan TEST. Ranking memakai VALID.
 
-N_FOLDS = 4
-
-# Minimum number of training samples
-MIN_TRAIN_SAMPLES = 100
-
-# Test size per fold
-TEST_SIZE = 200
+EVAL_SPLITS = ["valid", "test"]
 
 
 # ------------------------------------------------------------
@@ -304,25 +306,17 @@ def load_calendar():
             f"Calendar tidak ditemukan:\n{ALIGNED_DAILY_CSV}"
         )
 
-    df = pd.read_csv(ALIGNED_DAILY_CSV)
-
-    if "date" not in df.columns:
-        raise ValueError("Kolom wajib 'date' tidak ada di aligned_daily.csv")
+    # Hari, volatility_class, dan kolom split (train/valid/test) diambil dari
+    # split resmi 70/15/15 (dataset_split.canonical_split) -- identik dengan
+    # train_combined.py di Tugas 2.
+    df = canonical_split()[["date", "split", TARGET_COLUMN]].copy()
 
     df["date"] = pd.to_datetime(
         df["date"],
         errors="coerce"
     )
 
-    if df["date"].isna().any():
-
-        raise ValueError(
-            "Terdapat date yang tidak valid pada aligned_daily.csv"
-        )
-
     df = df.sort_values("date").reset_index(drop=True)
-    # Generate the report-defined label if the upstream file only has realized_vol.
-    df, _ = add_volatility_class_from_report(df)
 
     # Match label casing from the report (Low / Medium / High) while using
     # normalized lowercase strings internally. Do not drop null labels here:
@@ -458,7 +452,7 @@ def load_aggregation_data(
 
     df = df.merge(
         calendar[
-            ["date", TARGET_COLUMN]
+            ["date", "split", TARGET_COLUMN]
         ],
         on="date",
         how="inner",
@@ -943,52 +937,32 @@ def calculate_metrics(
 # ============================================================
 
 def create_folds(
-    n_samples
+    split
 ):
+    """
+    Split resmi 70/15/15: classifier di-fit di TRAIN, lalu dievaluasi
+    terpisah di VALID dan TEST. "fold" berisi nama split evaluasi.
+    """
+
+    split = np.asarray(split)
+
+    train_idx = np.flatnonzero(split == "train")
 
     folds = []
 
-    train_end = MIN_TRAIN_SAMPLES
+    for eval_split in EVAL_SPLITS:
 
-    while (
-        train_end < n_samples
-        and len(folds) < N_FOLDS
-    ):
+        test_idx = np.flatnonzero(split == eval_split)
 
-        test_start = train_end
+        if len(train_idx) and len(test_idx):
 
-        test_end = min(
-            test_start + TEST_SIZE,
-            n_samples
-        )
-
-        if test_start >= test_end:
-            break
-
-        train_idx = np.arange(
-            0,
-            train_end
-        )
-
-        test_idx = np.arange(
-            test_start,
-            test_end
-        )
-
-        folds.append(
-            {
-                "fold":
-                    len(folds) + 1,
-
-                "train_idx":
-                    train_idx,
-
-                "test_idx":
-                    test_idx,
-            }
-        )
-
-        train_end = test_end
+            folds.append(
+                {
+                    "fold": eval_split,
+                    "train_idx": train_idx,
+                    "test_idx": test_idx,
+                }
+            )
 
     return folds
 
@@ -1037,7 +1011,7 @@ def evaluate_one_file(
     # --------------------------------------------------------
 
     folds = create_folds(
-        len(X)
+        df["split"].to_numpy()
     )
 
     if not folds:
@@ -1053,6 +1027,10 @@ def evaluate_one_file(
     # --------------------------------------------------------
 
     for fold_info in folds:
+
+        # Seed yang sama tiap iterasi -> classifier yang dilatih untuk
+        # evaluasi VALID dan TEST identik (data train dan seed sama).
+        set_seed()
 
         fold_id = fold_info["fold"]
 
@@ -1371,32 +1349,25 @@ def aggregate_results(
         "aggregation":
             first["aggregation"],
 
-        "n_folds":
-            len(fold_results),
-
         "n_features":
             first["n_features"],
 
+        "train_samples":
+            first["train_samples"],
+
     }
 
-    for metric in numeric_metrics:
+    # Satu kolom per (metrik, eval split), mis. accuracy_valid, accuracy_test.
+    # Ranking memakai *_valid; *_test hanya dilaporkan.
+    for r in fold_results:
 
-        values = [
-            r[metric]
-            for r in fold_results
-        ]
+        split_name = r["fold"]
 
-        result[
-            f"{metric}_mean"
-        ] = float(
-            np.mean(values)
-        )
+        result[f"n_{split_name}"] = r["test_samples"]
 
-        result[
-            f"{metric}_std"
-        ] = float(
-            np.std(values)
-        )
+        for metric in numeric_metrics:
+
+            result[f"{metric}_{split_name}"] = float(r[metric])
 
     return result
 
@@ -1476,8 +1447,8 @@ def main():
     )
 
     print(
-        f"Validation folds: "
-        f"{N_FOLDS}"
+        "Split: official 70/15/15 "
+        "(fit train, report valid & test)"
     )
 
     print(
@@ -1647,8 +1618,9 @@ def main():
             all_summary_results
         )
 
+        # Ranking berdasarkan VALID (test tidak dipakai untuk memilih).
         summary_df = summary_df.sort_values(
-            "accuracy_mean",
+            ["accuracy_valid", "macro_f1_valid"],
             ascending=False
         ).reset_index(
             drop=True
@@ -1676,19 +1648,18 @@ def main():
             "rank",
             "model",
             "aggregation",
-            "n_folds",
             "n_features",
-            "accuracy_mean",
-            "accuracy_std",
-            "macro_f1_mean",
-            "macro_f1_std",
-            "balanced_accuracy_mean",
-            "balanced_accuracy_std",
-            "mcc_mean",
-            "mcc_std",
-            "f1_low_mean",
-            "f1_medium_mean",
-            "f1_high_mean",
+            "accuracy_valid",
+            "macro_f1_valid",
+            "balanced_accuracy_valid",
+            "mcc_valid",
+            "accuracy_test",
+            "macro_f1_test",
+            "balanced_accuracy_test",
+            "mcc_test",
+            "f1_low_valid",
+            "f1_medium_valid",
+            "f1_high_valid",
         ]
 
         ranking_columns = [
@@ -1720,7 +1691,7 @@ def main():
         print()
         print(
             "TOP 10 CONFIGURATIONS "
-            "BERDASARKAN MEAN ACCURACY"
+            "BERDASARKAN AKURASI VALID"
         )
 
         top10 = (
@@ -1728,7 +1699,7 @@ def main():
                 all_summary_results
             )
             .sort_values(
-                "accuracy_mean",
+                ["accuracy_valid", "macro_f1_valid"],
                 ascending=False
             )
             .head(10)
@@ -1737,12 +1708,10 @@ def main():
         display_columns = [
             "model",
             "aggregation",
-            "accuracy_mean",
-            "accuracy_std",
-            "macro_f1_mean",
-            "macro_f1_std",
-            "balanced_accuracy_mean",
-            "mcc_mean",
+            "accuracy_valid",
+            "macro_f1_valid",
+            "accuracy_test",
+            "macro_f1_test",
         ]
 
         print(
