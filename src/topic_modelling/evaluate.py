@@ -44,7 +44,9 @@ GENSIM_PROCESSES = 1
 # The model with the highest weighted score is only a quantitative candidate.
 # Set one of: "bertopic", "lda", "dtm", "top2vec" to manually override it.
 # Leave as None to select the highest-scoring candidate automatically.
-SELECTED_MODEL_OVERRIDE: str | None = None
+# Final choice: LDA retains full document coverage and is the most stable,
+# interpretable candidate under the shared forecasting evaluation protocol.
+SELECTED_MODEL_OVERRIDE: str | None = "lda"
 
 # Provisional model-selection weights. The script renormalizes weights when
 # a metric is unavailable. These weights are a transparent heuristic,
@@ -844,11 +846,12 @@ def main() -> None:
         "selected_model": selected_model,
         "selection_type": "manual_override" if SELECTED_MODEL_OVERRIDE else "provisional_quantitative_candidate",
         "score_weights": SCORE_WEIGHTS,
-        "selected_model_is_final": False,
+        "selected_model_is_final": selected_model == "lda",
         "note": (
-            "Ini adalah kandidat berdasarkan metrik otomatis. Periksa topic_interpretation_template.csv "
-            "dan validasi tema secara manual sebelum menetapkan model final. Selanjutnya uji fitur "
-            "pada validation/test time split untuk mengukur kontribusi terhadap forecasting USD/IDR."
+            "LDA ditetapkan sebagai model final: cakupan dokumen penuh, interpretabilitas "
+            "stabil, dan evaluasi forecasting memakai split kronologis pusat 70/15/15."
+            if selected_model == "lda"
+            else "Model dipilih melalui override manual; periksa interpretasi dan evaluasi forecasting."
         ),
         "available_models": sorted(available_models),
     }
